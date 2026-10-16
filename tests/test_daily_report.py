@@ -425,3 +425,114 @@ class TestBackfill(TempDirTest):
     def test_unrelated_file_names_are_ignored(self):
         self.write("request-logs/requests-broken.jsonl", "{}\n")
         self.assertEqual(report.backfill_snapshot(self.path, self.log_dir, "2026-10-16"), 0)
+
+
+class TestCollectHost(TempDirTest):
+    def runner(self):
+        return FakeRunner({
+            "df -P": (0, "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                         "/dev/vda1 40900608 17301504 21963904 45% /"),
+            "free -m": (0, "              total        used        free      shared  buff/cache"
+                           "   available\n"
+                           "Mem:           1870        1066         300          10"
+                           "         503         804"),
+            "systemctl --failed": (0, "kdump.service loaded failed failed Kdump"),
+        })
+
+    def test_disk_is_parsed(self):
+        data = report.collect_host(runner=self.runner())
+        self.assertEqual(data["disk_pct"], 45)
+        self.assertEqual(data["disk_total"], 40900608 * 1024)
+        self.assertEqual(data["disk_used"], 17301504 * 1024)
+
+    def test_memory_is_parsed(self):
+        data = report.collect_host(runner=self.runner())
+        self.assertEqual(data["mem_total"], 1870)
+        self.assertEqual(data["mem_used"], 1066)
+        self.assertEqual(data["mem_pct"], 57)
+
+    def test_failed_units_are_listed(self):
+        self.assertEqual(report.collect_host(runner=self.runner())["failed_units"],
+                         ["kdump.service"])
+
+    def test_runner_failure_leaves_none_not_zero(self):
+        data = report.collect_host(runner=FakeRunner({}))
+        self.assertIsNone(data["disk_pct"])
+        self.assertIsNone(data["mem_pct"])
+        self.assertIsNone(data["failed_units"])
+
+
+class TestCollectServices(TempDirTest):
+    def runner(self, pgrep=(0, "123"), systemctl=(0, "active"),
+               docker=(0, "running|2026-10-12T06:22:15.123456789Z")):
+        return FakeRunner({"pgrep": pgrep, "systemctl": systemctl, "docker": docker})
+
+    def test_all_green(self):
+        data = report.collect_services(runner=self.runner(), probe=lambda port: True)
+        self.assertEqual(len(data["procs"]), 3)
+        self.assertTrue(all(p["ok"] for p in data["procs"]))
+        self.assertTrue(data["units"][0]["ok"])
+        self.assertTrue(data["container"]["ok"])
+        self.assertEqual(data["container"]["started"], "2026-10-12T06:22:15")
+        self.assertTrue(all(p["ok"] for p in data["ports"]))
+
+    def test_missing_process(self):
+        data = report.collect_services(runner=self.runner(pgrep=(1, "")), probe=lambda port: True)
+        self.assertFalse(any(p["ok"] for p in data["procs"]))
+
+    def test_dead_port_is_reported(self):
+        data = report.collect_services(runner=self.runner(), probe=lambda port: port != 3306)
+        self.assertEqual([p["port"] for p in data["ports"] if not p["ok"]], [3306])
+
+    def test_container_query_failure(self):
+        data = report.collect_services(runner=self.runner(docker=(1, "")), probe=lambda port: True)
+        self.assertFalse(data["container"]["ok"])
+        self.assertIsNone(data["container"]["status"])
+
+    def test_non_active_unit(self):
+        data = report.collect_services(runner=self.runner(systemctl=(3, "inactive")),
+                                       probe=lambda port: True)
+        self.assertFalse(data["units"][0]["ok"])
+        self.assertEqual(data["units"][0]["state"], "inactive")
+
+
+class TestCollectSites(TempDirTest):
+    OK = {"http://shiliu153.cn/": (200, ""),
+          "https://shiliu153.cn/": (200, ""),
+          "https://shiliu153.me/": (200, ""),
+          "https://wb.shiliu153.me/healthz": (200, '{"healthy": 3, "total": 3}')}
+
+    def test_all_reachable_and_healthz_note(self):
+        rows = report.collect_sites(opener=FakeOpener(dict(self.OK)))
+        self.assertTrue(all(r["ok"] for r in rows))
+        health = [r for r in rows if "healthz" in r["url"]][0]
+        self.assertEqual(health["note"], "健康账号 3/3")
+
+    def test_cert_mismatch_is_a_known_issue(self):
+        results = dict(self.OK)
+        results["https://shiliu153.cn/"] = urllib.error.URLError(
+            ssl.SSLCertVerificationError("no alternative certificate subject name matches"))
+        rows = report.collect_sites(opener=FakeOpener(results))
+        cn = [r for r in rows if r["label"] == "shiliu153.cn (https)"][0]
+        self.assertFalse(cn["ok"])
+        self.assertEqual(cn["note"], "证书不匹配")
+        self.assertTrue(cn["known"])
+        self.assertEqual(cn["known_reason"], ".cn 正在备案中，暂不处理证书")
+
+    def test_unreachable_site_is_not_known(self):
+        results = dict(self.OK)
+        results["https://shiliu153.me/"] = urllib.error.URLError(OSError("connection refused"))
+        rows = report.collect_sites(opener=FakeOpener(results))
+        me = [r for r in rows if r["label"] == "shiliu153.me (https)"][0]
+        self.assertFalse(me["ok"])
+        self.assertFalse(me["known"])
+        self.assertEqual(me["note"], "connection refused")
+
+    def test_http_error_code_is_recorded(self):
+        results = dict(self.OK)
+        results["https://shiliu153.me/"] = urllib.error.HTTPError(
+            "https://shiliu153.me/", 502, "Bad Gateway", {}, None)
+        rows = report.collect_sites(opener=FakeOpener(results))
+        me = [r for r in rows if r["label"] == "shiliu153.me (https)"][0]
+        self.assertEqual(me["code"], 502)
+        self.assertFalse(me["ok"])

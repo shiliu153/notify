@@ -378,130 +378,148 @@ def table(headers, rows):
 # ---- 一、主机 -------------------------------------------------------------
 
 
-def collect_host():
-    section("一、主机")
-    rows = []
+def probe_port(port):
+    """本机端口是否可连接。"""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=3):
+            return True
+    except OSError:
+        return False
 
-    code, out = run(["df", "-P", "/"])
+
+def collect_host(runner=run):
+    """主机资源。采集失败的字段留 None（不是 0）。"""
+    data = {"disk_used": None, "disk_total": None, "disk_pct": None,
+            "mem_used": None, "mem_total": None, "mem_pct": None,
+            "load1": None, "load5": None, "load15": None,
+            "uptime_s": None, "failed_units": None}
+
+    code, out = runner(["df", "-P", "/"])
     if code == 0 and len(out.splitlines()) >= 2:
         parts = out.splitlines()[1].split()
         if len(parts) >= 5:
-            # df -P 的容量列单位是 1K 块
-            total = int(parts[1]) * 1024
-            used = int(parts[2]) * 1024
-            rows.append(("磁盘 /", "%s / %s (%s)" % (human_bytes(used), human_bytes(total), parts[4])))
-    else:
-        rows.append(("磁盘 /", "采集失败"))
+            try:
+                data["disk_total"] = int(parts[1]) * 1024
+                data["disk_used"] = int(parts[2]) * 1024
+                data["disk_pct"] = int(parts[4].rstrip("%"))
+            except ValueError:
+                pass
 
-    code, out = run(["free", "-m"])
+    code, out = runner(["free", "-m"])
     if code == 0:
         for line in out.splitlines():
             if line.startswith("Mem:"):
                 parts = line.split()
-                total, used, avail = int(parts[1]), int(parts[2]), int(parts[6])
-                rows.append(
-                    (
-                        "内存",
-                        "%dM / %dM (%.0f%%，可用 %dM)" % (used, total, 100.0 * used / total, avail),
-                    )
-                )
-    else:
-        rows.append(("内存", "采集失败"))
+                try:
+                    total, used = int(parts[1]), int(parts[2])
+                except (IndexError, ValueError):
+                    break
+                data["mem_total"], data["mem_used"] = total, used
+                data["mem_pct"] = int(round(100.0 * used / total))
+                break
 
     try:
         load1, load5, load15 = os.getloadavg()
-        rows.append(("负载 1/5/15 分钟", "%.2f / %.2f / %.2f" % (load1, load5, load15)))
-    except OSError:
-        rows.append(("负载", "采集失败"))
+        data["load1"], data["load5"], data["load15"] = load1, load5, load15
+    except (OSError, AttributeError):
+        pass
 
     try:
         with open("/proc/uptime", "r") as fh:
-            seconds = float(fh.read().split()[0])
-        days, rem = divmod(int(seconds), 86400)
-        rows.append(("运行时长", "%d 天 %d 小时" % (days, rem // 3600)))
-    except Exception:
-        rows.append(("运行时长", "采集失败"))
+            data["uptime_s"] = int(float(fh.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        pass
 
-    code, out = run(["systemctl", "--failed", "--no-legend", "--no-pager"])
+    code, out = runner(["systemctl", "--failed", "--no-legend", "--no-pager"])
     if code == 0:
-        failed = [line.split()[0] for line in out.splitlines() if line.strip()]
-        rows.append(("失败的 systemd 单元", "无" if not failed else "、".join(failed)))
+        data["failed_units"] = [line.split()[0] for line in out.splitlines() if line.strip()]
 
-    table(["项目", "值"], rows)
+    return data
 
 
 # ---- 二、服务存活 ---------------------------------------------------------
 
 
-def collect_services():
-    section("二、服务存活")
-    rows = []
+def collect_services(runner=run, probe=probe_port):
+    """进程 / systemd 单元 / 容器 / 端口。
+
+    存活判定走进程名与端口，不走 systemd：nginx / mysqld 由宝塔直接拉起，
+    它们的 LSB 脚本 is-active 恒为 inactive。docker 是真 systemd 单元。
+    """
+    data = {"procs": [], "units": [], "container": None, "ports": []}
 
     for process, label in PROCESSES:
-        code, out = run(["pgrep", "-x", process])
+        code, out = runner(["pgrep", "-x", process])
         count = len([line for line in out.splitlines() if line.strip()]) if code == 0 else 0
-        rows.append((label, "✅ 运行中（%d 个进程）" % count if count else "❌ 未运行"))
+        data["procs"].append({"label": label, "count": count, "ok": count > 0})
 
     for unit in UNITS:
-        code, out = run(["systemctl", "is-active", unit])
+        code, out = runner(["systemctl", "is-active", unit])
         state = out or "unknown"
-        rows.append((unit, "✅ %s" % state if code == 0 else "❌ %s" % state))
+        data["units"].append({"label": unit, "state": state,
+                              "ok": code == 0 and state == "active"})
 
-    code, out = run(
-        ["docker", "inspect", "-f", "{{.State.Status}}|{{.State.StartedAt}}", "workbuddy2api"]
-    )
+    code, out = runner(["docker", "inspect", "-f",
+                        "{{.State.Status}}|{{.State.StartedAt}}", "workbuddy2api"])
     if code == 0 and "|" in out:
         status, started = out.split("|", 1)
-        rows.append(("容器 workbuddy2api", "✅ %s（启动于 %s）" % (status, started[:19])))
+        data["container"] = {"name": "workbuddy2api", "status": status,
+                             "started": started[:19], "ok": status == "running"}
     else:
-        rows.append(("容器 workbuddy2api", "❌ 查询失败"))
+        data["container"] = {"name": "workbuddy2api", "status": None,
+                             "started": None, "ok": False, "error": "查询失败"}
 
     for port, label in PORTS:
-        try:
-            with socket.create_connection(("127.0.0.1", port), timeout=3):
-                rows.append(("端口 %d" % port, "✅ %s" % label))
-        except OSError:
-            rows.append(("端口 %d" % port, "❌ %s 未监听" % label))
+        data["ports"].append({"port": port, "label": label, "ok": bool(probe(port))})
 
-    table(["对象", "状态"], rows)
+    return data
 
 
 # ---- 三、网站可用性 -------------------------------------------------------
 
 
-def collect_sites():
-    section("三、网站可用性")
+def collect_sites(opener=None):
+    """站点可用性。SSL 证书错误单独归类，便于已知项白名单匹配。"""
+    opener = opener or urllib.request.urlopen
     rows = []
     for label, url in SITES:
         started = time.time()
+        entry = {"label": label, "url": url, "ok": False, "code": None,
+                 "elapsed": None, "note": "", "known": False, "known_reason": None}
         try:
             request = urllib.request.Request(url, headers={"User-Agent": "notify-daily-report"})
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
+            with opener(request, timeout=HTTP_TIMEOUT) as response:
                 code = response.status
                 body = response.read(4096).decode("utf-8", "replace")
-            elapsed = time.time() - started
-            extra = ""
+            entry["code"] = code
+            entry["elapsed"] = time.time() - started
+            entry["ok"] = 200 <= code < 400
             if "healthz" in url:
                 try:
                     payload = json.loads(body)
-                    extra = "（健康账号 %s/%s）" % (payload.get("healthy"), payload.get("total"))
+                    entry["note"] = "健康账号 %s/%s" % (payload.get("healthy"),
+                                                        payload.get("total"))
                 except ValueError:
                     pass
-            mark = "✅" if 200 <= code < 400 else "⚠️"
-            rows.append((label, "%s %d" % (mark, code), "%.2fs%s" % (elapsed, extra)))
         except urllib.error.HTTPError as exc:
-            rows.append((label, "⚠️ %d" % exc.code, "%.2fs" % (time.time() - started)))
+            entry["code"] = exc.code
+            entry["elapsed"] = time.time() - started
+            entry["note"] = "HTTP %d" % exc.code
         except urllib.error.URLError as exc:
+            entry["elapsed"] = time.time() - started
             reason = exc.reason
             if isinstance(reason, ssl.SSLCertVerificationError):
-                rows.append((label, "⚠️ 证书不匹配", "域名不在证书 SAN 内"))
+                entry["note"] = "证书不匹配"
             elif isinstance(reason, ssl.SSLError):
-                rows.append((label, "⚠️ TLS 错误", str(reason)[:60]))
+                entry["note"] = "TLS 错误"
             else:
-                rows.append((label, "❌ 不可达", str(reason)[:60]))
+                entry["note"] = str(reason)[:60]
         except Exception as exc:  # noqa: BLE001
-            rows.append((label, "❌ 不可达", type(exc).__name__))
-    table(["站点", "状态", "备注"], rows)
+            entry["note"] = type(exc).__name__
+        entry["known_reason"] = known_reason(entry["label"], entry["note"])
+        entry["known"] = entry["known_reason"] is not None
+        rows.append(entry)
+    return rows
 
 
 # ---- 四、workbuddy2api 用量 ----------------------------------------------
