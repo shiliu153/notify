@@ -1,0 +1,6 @@
+# /etc/cron.d/notify —— 每天 08:00 发日报
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+0 8 * * * root /path/to/daily-report.sh >/tmp/daily-report.md 2>/tmp/daily-report.err \
+  && /opt/notify/bin/notify send --title "服务器日报 $(date +\%F)" \
+       --body-file /tmp/daily-report.md --dedup-key daily-digest || true

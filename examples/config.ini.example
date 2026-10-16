@@ -1,0 +1,32 @@
+; notify 配置样例 —— 复制到 ~/.config/notify/config.ini 并 chmod 600
+[message]
+to             = <你的QQ号>@qq.com
+from_name      = 服务器日报
+subject_prefix = [日报]
+
+; 主通道：阿里云邮件推送（值以控制台为准）
+[channels.email.directmail]
+enabled      = true
+host         = smtpdm.aliyun.com
+port         = 465
+username     = notice@<你的域名>
+password_env = NOTIFY_DM_PASSWORD
+
+; 降级通道：QQ 邮箱（授权码，不是登录密码）
+[channels.email.qq]
+enabled      = true
+host         = smtp.qq.com
+port         = 465
+username     = <你的QQ号>@qq.com
+password_env = NOTIFY_QQ_AUTHCODE
+
+[limits]
+per_minute           = 5
+per_day              = 50
+dedup_window_minutes = 720
+
+[log]
+path = ~/.local/state/notify/notify.jsonl
+
+[state]
+path = ~/.local/state/notify/state.db
