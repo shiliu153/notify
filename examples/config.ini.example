@@ -12,9 +12,14 @@ port         = 465
 username     = notice@<你的域名>
 password_env = NOTIFY_DM_PASSWORD
 
-; 降级通道：QQ 邮箱（授权码，不是登录密码）
+; 降级通道：QQ 邮箱（可选，默认关闭）
+;
+; 权衡：它能覆盖 DirectMail 挂掉的情况，但 QQ 授权码可以经 IMAP **读取整个邮箱**
+; （所有邮件、验证码、密码重置链接），凭据价值远高于它带来的降级收益。
+; 本项目的实际部署（shiliu153）已移除该通道，只保留 DirectMail。
+; 要启用：把 enabled 改回 true，并在 /etc/notify/env 里配 NOTIFY_QQ_AUTHCODE。
 [channels.email.qq]
-enabled      = true
+enabled      = false
 host         = smtp.qq.com
 port         = 465
 username     = <你的QQ号>@qq.com
