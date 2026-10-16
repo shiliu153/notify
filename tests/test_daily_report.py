@@ -921,6 +921,28 @@ class TestRenderRequests(unittest.TestCase):
         text = "\n".join(report.render_requests(metrics, green_history()))
         self.assertIn("峰值时段：23:00–00:00（126 次）", text)
 
+    def test_retries_row_formats_both_sides_the_same(self):
+        history = green_history()
+        yesterday = green_metrics()["requests"]
+        yesterday["count"] = 120
+        yesterday["retries"] = 9
+        history["yesterday"] = {"requests": yesterday}
+        text = "\n".join(report.render_requests(green_metrics(), history))
+        self.assertIn("| 重试 | 1 次（0.35%） | 9 次（7.50%） | -89% |", text)
+
+    def test_long_user_agent_drops_the_parenthetical_note(self):
+        metrics = green_metrics()
+        metrics["requests"]["by_ua"] = {
+            "deepseek-harness/0.2.0-rc.2 (+https://github.com/deepseek-ai/deepseek-harness)": 427}
+        text = "\n".join(report.render_requests(metrics, green_history()))
+        self.assertIn("deepseek-harness/0.2.0-rc.2 427", text)
+        self.assertNotIn("github.com", text)
+
+    def test_shorten(self):
+        self.assertEqual(report._shorten("short"), "short")
+        self.assertEqual(report._shorten("x" * 60), "x" * 39 + "…")
+        self.assertEqual(report._shorten("a (b)"), "a")
+
 
 class TestRenderCredits(unittest.TestCase):
     def test_no_history_says_so(self):

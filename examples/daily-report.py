@@ -866,11 +866,26 @@ def _pct(value):
     return "—" if value is None else "%.2f%%" % value
 
 
+def _shorten(text, limit=40):
+    """展示用短名：先去掉 UA 常见的括号注释，再按长度截断。"""
+    head = str(text).split(" (", 1)[0]
+    if len(head) <= limit:
+        return head
+    return head[:limit - 1] + "…"
+
+
 def _dist(counts, limit=3):
     if not counts:
         return "—"
     items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
-    return " ｜ ".join("%s %d" % (name, count) for name, count in items)
+    return " ｜ ".join("%s %d" % (_shorten(name), count) for name, count in items)
+
+
+def _retries_cell(retries, count):
+    """重试单元格：今日与昨日两侧格式必须一致。"""
+    if retries is None or not count:
+        return "—"
+    return "%d 次（%.2f%%）" % (retries, 100.0 * retries / count)
 
 
 def _yesterday_requests(history):
@@ -901,9 +916,8 @@ def render_requests(metrics, history):
                            _ms(yesterday.get("p99"))), "—"),
         ("TTFB P50 / P90", "%s / %s" % (_ms(today["ttfb_p50"]), _ms(today["ttfb_p90"])),
          "%s / %s" % (_ms(yesterday.get("ttfb_p50")), _ms(yesterday.get("ttfb_p90"))), "—"),
-        ("重试", "%d 次（%.2f%%）" % (today["retries"],
-                                    100.0 * today["retries"] / today["count"]),
-         yesterday.get("retries", "—"),
+        ("重试", _retries_cell(today["retries"], today["count"]),
+         _retries_cell(yesterday.get("retries"), yesterday.get("count")),
          delta(today["retries"], yesterday.get("retries"))),
         ("总 tokens", human_tokens(today["tokens_total"]),
          _human_or_dash(yesterday.get("tokens_total")),
