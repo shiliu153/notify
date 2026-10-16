@@ -277,3 +277,90 @@ class TestRequestsMetrics(TempDirTest):
         self.assertEqual(m["failed"], 0)
         self.assertIsNone(m["peak_hour"])
         self.assertEqual(m["slowest"]["hhmm"], "—")
+
+
+class TestSnapshot(TempDirTest):
+    def setUp(self):
+        super().setUp()
+        self.path = self.root / "daily-stats.jsonl"
+
+    def row(self, day, **extra):
+        base = {"date": day, "requests": {"count": 1}}
+        base.update(extra)
+        return base
+
+    def test_write_then_read(self):
+        report.save_snapshot(self.row("2026-10-16"), self.path, "2026-10-16")
+        self.assertEqual([r["date"] for r in report.load_snapshot(self.path)], ["2026-10-16"])
+
+    def test_same_day_replaces_instead_of_appending(self):
+        report.save_snapshot(self.row("2026-10-16", requests={"count": 1}), self.path, "2026-10-16")
+        report.save_snapshot(self.row("2026-10-16", requests={"count": 9}), self.path, "2026-10-16")
+        rows = report.load_snapshot(self.path)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["requests"]["count"], 9)
+
+    def test_rows_sorted_by_date(self):
+        report.save_snapshot(self.row("2026-10-16"), self.path, "2026-10-16")
+        report.save_snapshot(self.row("2026-10-15"), self.path, "2026-10-15")
+        self.assertEqual([r["date"] for r in report.load_snapshot(self.path)],
+                         ["2026-10-15", "2026-10-16"])
+
+    def test_creates_missing_directory(self):
+        nested = self.root / "a" / "b" / "stats.jsonl"
+        report.save_snapshot(self.row("2026-10-16"), nested, "2026-10-16")
+        self.assertTrue(nested.exists())
+
+    def test_retention_trims_rows_older_than_400_days(self):
+        report.save_snapshot(self.row("2025-01-01"), self.path, "2025-01-01")
+        report.save_snapshot(self.row("2026-10-16"), self.path, "2026-10-16")
+        self.assertEqual([r["date"] for r in report.load_snapshot(self.path)], ["2026-10-16"])
+
+    def test_unwritable_target_warns_without_raising(self):
+        blocked = self.root / "a-directory"
+        blocked.mkdir()
+        report.save_snapshot(self.row("2026-10-16"), blocked, "2026-10-16")
+
+    def test_corrupt_file_is_treated_as_no_history(self):
+        self.write("daily-stats.jsonl", "{not json at all\n")
+        self.assertEqual(report.load_snapshot(self.path), [])
+
+    def test_missing_file_is_no_history(self):
+        self.assertEqual(report.load_snapshot(self.root / "nope.jsonl"), [])
+
+    def test_rows_without_date_are_dropped(self):
+        self.write("daily-stats.jsonl", '{"requests": {"count": 1}}\n')
+        self.assertEqual(report.load_snapshot(self.path), [])
+
+    def test_find_yesterday(self):
+        rows = [self.row("2026-10-14"), self.row("2026-10-15")]
+        self.assertEqual(report.find_yesterday(rows, "2026-10-16")["date"], "2026-10-15")
+
+    def test_find_yesterday_missing(self):
+        self.assertIsNone(report.find_yesterday([self.row("2026-10-14")], "2026-10-16"))
+
+    def test_credit_base_picks_earliest_inside_window(self):
+        rows = [self.row("2026-10-05", credits={"a": {"left": 100}}),
+                self.row("2026-10-10", credits={"a": {"left": 90}}),
+                self.row("2026-10-15", credits={"a": {"left": 80}})]
+        self.assertEqual(report.find_credit_base(rows, "2026-10-16")["date"], "2026-10-10")
+
+    def test_credit_base_skips_rows_without_credits(self):
+        rows = [self.row("2026-10-12"), self.row("2026-10-13", credits={"a": {"left": 90}})]
+        self.assertEqual(report.find_credit_base(rows, "2026-10-16")["date"], "2026-10-13")
+
+    def test_credit_base_none_when_no_history(self):
+        self.assertIsNone(report.find_credit_base([], "2026-10-16"))
+
+    def test_daily_consumption(self):
+        base = self.row("2026-10-10", credits={"a": {"left": 100}})
+        today = self.row("2026-10-16", credits={"a": {"left": 40}})
+        self.assertAlmostEqual(report.daily_consumption(base, today)["a"], 10.0)
+
+    def test_daily_consumption_skips_flat_missing_and_new_accounts(self):
+        base = self.row("2026-10-10", credits={"a": {"left": 100}, "b": {"left": 5}})
+        today = self.row("2026-10-16", credits={"a": {"left": 100}, "c": {"left": 1}})
+        self.assertEqual(report.daily_consumption(base, today), {})
+
+    def test_daily_consumption_without_base(self):
+        self.assertEqual(report.daily_consumption(None, self.row("2026-10-16")), {})

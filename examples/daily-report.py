@@ -242,6 +242,89 @@ def requests_metrics(rows):
     }
 
 
+def _write_snapshot_rows(rows, path):
+    """按日期排序后原子写入快照文件。"""
+    path = Path(path)
+    ordered = sorted(rows, key=lambda r: str(r["date"]))
+    text = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in ordered)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(str(tmp), "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(str(tmp), str(path))
+
+
+def load_snapshot(path):
+    """读取快照行，按日期升序。文件缺失或损坏 → []。"""
+    rows, _bad = read_jsonl(path)
+    good = [r for r in rows if isinstance(r, dict) and r.get("date")]
+    good.sort(key=lambda r: str(r["date"]))
+    return good
+
+
+def save_snapshot(metrics, path, today):
+    """写入今天这一行：替换同日行、裁剪超期行、原子替换。
+
+    任何失败都只打印一行警告——日报必须照发。
+    """
+    try:
+        rows = [r for r in load_snapshot(path) if str(r.get("date")) != today]
+        rows.append(metrics)
+        cutoff = (datetime.strptime(today, "%Y-%m-%d")
+                  - timedelta(days=SNAPSHOT_RETAIN_DAYS)).strftime("%Y-%m-%d")
+        rows = [r for r in rows if str(r["date"]) >= cutoff]
+        _write_snapshot_rows(rows, path)
+    except Exception as exc:  # noqa: BLE001 - 快照失败不得影响日报
+        print("快照写入失败：%s: %s" % (type(exc).__name__, exc))
+
+
+def find_yesterday(rows, today):
+    """快照里日期为今天前一天的那行；没有 → None。"""
+    want = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    for row in rows:
+        if str(row.get("date")) == want:
+            return row
+    return None
+
+
+def find_credit_base(rows, today, days=CREDIT_WINDOW_DAYS):
+    """最近 days 天内最早一条含余额记录的快照行；没有 → None。"""
+    start = (datetime.strptime(today, "%Y-%m-%d") - timedelta(days=days)).strftime("%Y-%m-%d")
+    candidates = [r for r in rows
+                  if start <= str(r.get("date")) < today
+                  and isinstance(r.get("credits"), dict) and r["credits"]]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda r: str(r["date"]))
+
+
+def daily_consumption(base_row, today_row):
+    """{账号: 日均消耗}。余额未下降、账号缺失、间隔非正 → 该账号不出现。"""
+    if not base_row or not today_row:
+        return {}
+    try:
+        gap = (datetime.strptime(str(today_row["date"]), "%Y-%m-%d")
+               - datetime.strptime(str(base_row["date"]), "%Y-%m-%d")).days
+    except (KeyError, ValueError):
+        return {}
+    if gap <= 0:
+        return {}
+    base = base_row.get("credits") or {}
+    now = today_row.get("credits") or {}
+    out = {}
+    for name, entry in now.items():
+        before = base.get(name)
+        if not isinstance(before, dict) or not isinstance(entry, dict):
+            continue
+        left_before, left_now = before.get("left"), entry.get("left")
+        if left_before is None or left_now is None:
+            continue
+        spent = (left_before - left_now) / float(gap)
+        if spent > 0:
+            out[name] = spent
+    return out
+
+
 def section(title):
     print()
     print("## %s" % title)
