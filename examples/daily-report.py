@@ -698,6 +698,79 @@ def collect_nginx_errors(log_dir=None, today=None):
     return {"today_lines": total, "files": files}
 
 
+def count_checks(cert_count):
+    """硬故障巡检项总数。"""
+    return (len(PROCESSES) + len(UNITS) + 1 + len(PORTS) + len(SITES)
+            + 1 + 1 + cert_count)
+
+
+def count_service_checks(metrics):
+    """服务类巡检的 (正常数, 总数)，即第一节"进程 · 端口 · 容器"那一行。"""
+    services = metrics.get("services") or {}
+    procs = services.get("procs") or []
+    units = services.get("units") or []
+    ports = services.get("ports") or []
+    container = services.get("container")
+    total = len(procs) + len(units) + len(ports) + (1 if container else 0)
+    ok = (sum(1 for p in procs if p["ok"]) + sum(1 for u in units if u["ok"])
+          + sum(1 for p in ports if p["ok"])
+          + (1 if container and container["ok"] else 0))
+    return ok, total
+
+
+def count_known(metrics):
+    """已知项条数。"""
+    return sum(1 for site in (metrics.get("sites") or []) if site.get("known"))
+
+
+def hard_failures(metrics):
+    """硬故障清单（克刻口径）。
+
+    判据自身采集失败（字段为 None）时**不进清单**：宁可漏报一次，
+    也不要因为采集器偶发抽风而天天误报。
+    """
+    problems = []
+
+    services = metrics.get("services")
+    if services:
+        for proc in (services.get("procs") or []):
+            if not proc["ok"]:
+                problems.append("进程 %s 未运行" % proc["label"])
+        for unit in (services.get("units") or []):
+            if not unit["ok"]:
+                problems.append("systemd 单元 %s 非 active（%s）" % (unit["label"], unit["state"]))
+        container = services.get("container")
+        if container and not container["ok"]:
+            problems.append("容器 %s 非 running" % container["name"])
+        for port in (services.get("ports") or []):
+            if not port["ok"]:
+                problems.append("端口 %d（%s）未监听" % (port["port"], port["label"]))
+
+    for site in (metrics.get("sites") or []):
+        if not site["ok"] and not site.get("known"):
+            problems.append("站点 %s 不可用（%s）" % (site["label"], site.get("note") or "原因未知"))
+
+    host = metrics.get("host")
+    if host and host.get("disk_pct") is not None and host["disk_pct"] >= DISK_HARD_PCT:
+        problems.append("磁盘 / 已用 %d%%（阈值 %d%%）" % (host["disk_pct"], DISK_HARD_PCT))
+
+    backup = metrics.get("backup")
+    if backup and not backup["ok"]:
+        if backup.get("age_hours") is None:
+            problems.append("找不到任何数据库备份")
+        else:
+            problems.append("最新备份已 %.1f 小时前（阈值 %d 小时）"
+                            % (backup["age_hours"], BACKUP_MAX_AGE_HOURS))
+
+    for domain, days in (metrics.get("certs") or {}).items():
+        if days is None:
+            problems.append("证书 %s 无法读取到期时间" % domain)
+        elif days <= CERT_HARD_DAYS:
+            problems.append("证书 %s 仅剩 %d 天" % (domain, days))
+
+    return problems
+
+
 # ---- main -----------------------------------------------------------------
 
 

@@ -731,3 +731,109 @@ class TestCollectNginxErrors(TempDirTest):
         data = report.collect_nginx_errors(log_dir=self.root / "nope",
                                            today=datetime(2026, 10, 16))
         self.assertEqual(data, {"today_lines": 0, "files": 0})
+
+
+class TestHardFailures(TempDirTest):
+    def green(self):
+        return green_metrics()
+
+    def test_all_green(self):
+        self.assertEqual(report.hard_failures(self.green()), [])
+
+    def test_disk_over_threshold(self):
+        metrics = self.green()
+        metrics["host"]["disk_pct"] = 91
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_disk_exactly_at_threshold_triggers(self):
+        metrics = self.green()
+        metrics["host"]["disk_pct"] = 90
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_stale_backup(self):
+        metrics = self.green()
+        metrics["backup"] = {"ok": False, "age_hours": 27.0, "latest": "2026-10-15T03:30:01"}
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_no_backup_at_all(self):
+        metrics = self.green()
+        metrics["backup"] = {"ok": False, "age_hours": None, "latest": None}
+        self.assertIn("找不到任何数据库备份", report.hard_failures(metrics))
+
+    def test_cert_near_expiry(self):
+        metrics = self.green()
+        metrics["certs"] = {"wb.shiliu153.me": 5}
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_cert_unreadable(self):
+        metrics = self.green()
+        metrics["certs"] = {"wb.shiliu153.me": None}
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_cert_at_threshold_triggers(self):
+        metrics = self.green()
+        metrics["certs"] = {"wb.shiliu153.me": 7}
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_dead_process_and_port(self):
+        metrics = self.green()
+        metrics["services"]["procs"] = [{"label": "nginx", "count": 0, "ok": False}]
+        metrics["services"]["ports"] = [{"port": 80, "label": "nginx http", "ok": False}]
+        self.assertEqual(len(report.hard_failures(metrics)), 2)
+
+    def test_dead_container(self):
+        metrics = self.green()
+        metrics["services"]["container"] = {"name": "workbuddy2api", "status": "exited",
+                                            "started": "x", "ok": False}
+        self.assertIn("容器 workbuddy2api 非 running", report.hard_failures(metrics))
+
+    def test_dead_unit(self):
+        metrics = self.green()
+        metrics["services"]["units"] = [{"label": "docker", "state": "inactive", "ok": False}]
+        self.assertIn("systemd 单元 docker 非 active（inactive）", report.hard_failures(metrics))
+
+    def test_unreachable_site(self):
+        metrics = self.green()
+        metrics["sites"] = [{"label": "shiliu153.me (https)", "url": "https://shiliu153.me/",
+                             "ok": False, "code": None, "elapsed": None,
+                             "note": "connection refused", "known": False,
+                             "known_reason": None}]
+        self.assertEqual(len(report.hard_failures(metrics)), 1)
+
+    def test_known_issue_is_not_a_hard_failure(self):
+        metrics = self.green()
+        metrics["sites"] = [{"label": "shiliu153.cn (https)", "url": "https://shiliu153.cn/",
+                             "ok": False, "code": None, "elapsed": None,
+                             "note": "证书不匹配", "known": True,
+                             "known_reason": ".cn 正在备案中，暂不处理证书"}]
+        self.assertEqual(report.hard_failures(metrics), [])
+
+    def test_collection_failure_is_never_a_hard_failure(self):
+        metrics = self.green()
+        metrics["host"] = None
+        metrics["backup"] = None
+        metrics["certs"] = None
+        metrics["services"] = None
+        metrics["sites"] = None
+        self.assertEqual(report.hard_failures(metrics), [])
+
+    def test_disk_collection_failure_is_not_a_hard_failure(self):
+        metrics = self.green()
+        metrics["host"]["disk_pct"] = None
+        self.assertEqual(report.hard_failures(metrics), [])
+
+    def test_check_count_formula(self):
+        self.assertEqual(report.count_checks(2), 20)
+
+    def test_service_check_counts(self):
+        self.assertEqual(report.count_service_checks(self.green()), (4, 4))
+
+    def test_service_check_counts_with_a_dead_port(self):
+        metrics = self.green()
+        metrics["services"]["ports"] = [{"port": 80, "label": "nginx http", "ok": False}]
+        self.assertEqual(report.count_service_checks(metrics), (3, 4))
+
+    def test_known_count(self):
+        metrics = self.green()
+        metrics["sites"].append({"label": "shiliu153.cn (https)", "ok": False, "known": True})
+        self.assertEqual(report.count_known(metrics), 1)
