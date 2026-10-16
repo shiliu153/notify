@@ -914,6 +914,13 @@ class TestRenderRequests(unittest.TestCase):
         text = "\n".join(report.render_requests(metrics, green_history()))
         self.assertIn("尚未生成或采集失败", text)
 
+    def test_peak_hour_wraps_past_midnight(self):
+        metrics = green_metrics()
+        metrics["requests"]["peak_hour"] = 23
+        metrics["requests"]["peak_hour_count"] = 126
+        text = "\n".join(report.render_requests(metrics, green_history()))
+        self.assertIn("峰值时段：23:00–00:00（126 次）", text)
+
 
 class TestRenderCredits(unittest.TestCase):
     def test_no_history_says_so(self):

@@ -921,7 +921,8 @@ def render_requests(metrics, history):
     lines.append("- 来源：%s（%s）" % (_dist(today["by_ip"]), _dist(today["by_ua"])))
     if today.get("peak_hour") is not None:
         lines.append("- 峰值时段：%02d:00–%02d:00（%d 次）"
-                     % (today["peak_hour"], today["peak_hour"] + 1, today["peak_hour_count"]))
+                     % (today["peak_hour"], (today["peak_hour"] + 1) % 24,
+                        today["peak_hour_count"]))
     return lines
 
 
