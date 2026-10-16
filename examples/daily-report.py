@@ -8,10 +8,17 @@
         --body-file /tmp/daily.md --dedup-key daily-digest
 
 设计原则：
-1. **任何一段采集失败都不许让整封日报消失**——每节独立 try，失败写一行原因。
-2. **不误报**。这台机器上 nginx / mysqld 由宝塔直接拉起，systemd 的
-   `nginx.service` / `mysqld.service` 是 LSB 脚本、`is-active` 恒为 inactive，
-   所以存活判定走进程名与端口，不走 systemd（docker 是真 systemd 单元，除外）。
+1. **结论置顶**。先全采（collector 返回 dict、不打印），再判定硬故障，
+   最后一次性渲染——否则结论层无法置顶。
+2. **任何一段采集失败都不许让整封日报消失**——每节独立 try，失败写一行原因。
+3. **结论层只报硬故障**（进程/端口/容器、站点不可用、磁盘满、备份超期、证书临期）；
+   其余全部进运营明细，明细里不加告警标记。
+4. **不误报**。nginx / mysqld 由宝塔直接拉起，systemd 的 `nginx.service` /
+   `mysqld.service` 是 LSB 脚本、`is-active` 恒为 inactive，所以存活判定走
+   进程名与端口，不走 systemd（docker 是真 systemd 单元，除外）。
+   同理，journal 的错误按 unit 分类计数——84 行里 82 行是 sshd 的公网扫描噪音。
+5. **环比靠快照**（/var/lib/notify/daily-stats.jsonl，一行一天）。快照写入失败
+   只打印一行警告，绝不影响日报。
 """
 from __future__ import annotations
 
@@ -1046,29 +1053,92 @@ def render(metrics, history, problems, failures, now=None, hostname=None):
 # ---- main -----------------------------------------------------------------
 
 
-def main():
-    now = datetime.now()
-    print("# 服务器日报 %s" % now.strftime("%Y-%m-%d"))
-    print()
-    print("生成时间：%s ｜ 主机：%s" % (now.strftime("%Y-%m-%d %H:%M:%S"), socket.gethostname()))
+COLLECTORS = [
+    ("host", collect_host),
+    ("services", collect_services),
+    ("sites", collect_sites),
+    ("backup", collect_backup),
+    ("certs", collect_certs),
+    ("requests", collect_requests),
+    ("credits", collect_credits),
+    ("journal", collect_journal),
+    ("ssh", collect_ssh),
+    ("nginx_errors", collect_nginx_errors),
+]
 
-    for collector in (
-        collect_host,
-        collect_services,
-        collect_sites,
-        collect_wb,
-        collect_request_logs,
-    ):
+
+def collect_all(collectors=None, failures=None):
+    """跑完全部采集器。单个失败记 None，不中断其余。"""
+    collectors = COLLECTORS if collectors is None else collectors
+    metrics = {}
+    for name, func in collectors:
         try:
-            collector()
+            metrics[name] = func()
         except Exception as exc:  # noqa: BLE001 - 单节失败不影响整封
-            section(collector.__name__)
-            print("本节采集失败：%s: %s" % (type(exc).__name__, exc))
+            metrics[name] = None
+            if failures is not None:
+                failures[name] = "%s: %s" % (type(exc).__name__, exc)
+    return metrics
 
-    print()
-    print("---")
-    print("由 notify + daily-report.py 自动生成")
+
+def build_snapshot_row(metrics, problems, today):
+    """把今天的采集结果压成快照的一行。"""
+    journal = metrics.get("journal") or {}
+    ssh = metrics.get("ssh") or {}
+    nginx_errors = metrics.get("nginx_errors") or {}
+    return {
+        "date": today,
+        "ts": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "host": metrics.get("host"),
+        "services": metrics.get("services"),
+        "sites": [{"label": site["label"], "ok": site["ok"], "code": site.get("code"),
+                   "elapsed": site.get("elapsed"), "known": site.get("known")}
+                  for site in (metrics.get("sites") or [])],
+        "requests": metrics.get("requests"),
+        "credits": metrics.get("credits"),
+        "certs": metrics.get("certs"),
+        "backup": metrics.get("backup"),
+        "system": {"journal_total": journal.get("total"),
+                   "journal_by_unit": journal.get("by_unit"),
+                   "ssh_failed": ssh.get("failed"),
+                   "ssh_accepted": ssh.get("accepted"),
+                   "nginx_err_lines": nginx_errors.get("today_lines")},
+        "hard_failures": problems,
+        "backfill": False,
+    }
+
+
+def main(argv=None, collectors=None, stats_path=None, out=None, today=None, log_dir=None):
+    """生成日报 → 写 stdout → 更新快照。始终返回 0。"""
+    out = out or sys.stdout
+    stats_path = Path(stats_path) if stats_path else SNAPSHOT_PATH
+    log_dir = Path(log_dir) if log_dir else REQUEST_LOG_DIR
+    today = today or datetime.now().strftime("%Y-%m-%d")
+
+    failures = {}
+    metrics = collect_all(collectors, failures)
+
+    backfill_snapshot(stats_path, log_dir, today)
+
+    rows = load_snapshot(stats_path)
+    yesterday = find_yesterday(rows, today)
+    base = find_credit_base(rows, today)
+    gap = 0
+    if base:
+        try:
+            gap = (datetime.strptime(today, "%Y-%m-%d")
+                   - datetime.strptime(str(base["date"]), "%Y-%m-%d")).days
+        except (KeyError, ValueError):
+            gap = 0
+    history = {"today": today, "yesterday": yesterday,
+               "credit_base": base, "credit_gap_days": gap}
+
+    problems = hard_failures(metrics)
+    out.write(render(metrics, history, problems, failures))
+
+    save_snapshot(build_snapshot_row(metrics, problems, today), stats_path, today)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

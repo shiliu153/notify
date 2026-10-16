@@ -996,3 +996,74 @@ class TestRender(unittest.TestCase):
         for line in text.splitlines():
             if line.startswith("|") and "---" not in line:
                 self.assertLessEqual(line.count("|") - 1, 4, "表格列数超过 4：%s" % line)
+
+
+class TestMain(TempDirTest):
+    def setUp(self):
+        super().setUp()
+        self.path = self.root / "daily-stats.jsonl"
+
+    def collectors(self, metrics):
+        names = ("host", "services", "sites", "backup", "certs",
+                 "requests", "credits", "journal", "ssh", "nginx_errors")
+        return [(name, (lambda value: (lambda: value))(metrics.get(name))) for name in names]
+
+    def run_main(self, metrics, today="2026-10-16"):
+        out = io.StringIO()
+        code = report.main(collectors=self.collectors(metrics), stats_path=self.path,
+                           out=out, today=today, log_dir=self.root)
+        return code, out.getvalue()
+
+    def test_end_to_end_green(self):
+        code, text = self.run_main(green_metrics())
+        self.assertEqual(code, 0)
+        self.assertIn("✅ 无硬故障 ｜ 20 项巡检", text)
+        self.assertIn("## 一、硬故障巡检", text)
+        self.assertIn("## 二、运营明细", text)
+        self.assertIn("### 请求质量（今日 285 次）", text)
+        self.assertTrue(self.path.exists())
+
+    def test_snapshot_row_written(self):
+        self.run_main(green_metrics())
+        row = report.load_snapshot(self.path)[-1]
+        self.assertEqual(row["date"], "2026-10-16")
+        self.assertFalse(row["backfill"])
+        self.assertEqual(row["requests"]["count"], 285)
+        self.assertEqual(row["hard_failures"], [])
+
+    def test_one_collector_raising_does_not_kill_the_report(self):
+        def boom():
+            raise RuntimeError("df 挂了")
+
+        collectors = self.collectors(green_metrics())
+        collectors[0] = ("host", boom)
+        out = io.StringIO()
+        code = report.main(collectors=collectors, stats_path=self.path, out=out,
+                           today="2026-10-16", log_dir=self.root)
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("## 二、运营明细", text)
+        self.assertIn("采集失败的节：host", text)
+
+    def test_second_run_compares_against_yesterday(self):
+        self.run_main(green_metrics(), today="2026-10-15")
+        _code, text = self.run_main(green_metrics(), today="2026-10-16")
+        self.assertIn("（昨日 57%）", text)
+        self.assertIn("| 请求数 | 285 | 285 | +0% |", text)
+
+    def test_hard_failure_is_reported_and_recorded(self):
+        metrics = green_metrics()
+        metrics["host"]["disk_pct"] = 95
+        _code, text = self.run_main(metrics)
+        self.assertIn("❌ 1 项硬故障", text)
+        self.assertIn("- ❌ 磁盘 / 已用 95%（阈值 90%）", text)
+        self.assertEqual(len(report.load_snapshot(self.path)[-1]["hard_failures"]), 1)
+
+    def test_credit_trend_appears_after_two_runs(self):
+        first = green_metrics()
+        first["credits"] = {"shiliu12318": {"left": 409, "total": 410}}
+        self.run_main(first, today="2026-10-10")
+        second = green_metrics()
+        second["credits"] = {"shiliu12318": {"left": 349, "total": 410}}
+        _code, text = self.run_main(second, today="2026-10-16")
+        self.assertIn("| shiliu12318 | 349 / 410 | 10.0 | 34 |", text)
