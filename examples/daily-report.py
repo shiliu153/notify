@@ -7,14 +7,18 @@
     /opt/notify/bin/notify send --title "服务器日报 $(date +%F)" \
         --body-file /tmp/daily.md --dedup-key daily-digest
 
-设计原则：**任何一段采集失败都不许让整封日报消失**——每节独立 try，
-失败就写一行"采集失败：原因"，其余照常。
+设计原则：
+1. **任何一段采集失败都不许让整封日报消失**——每节独立 try，失败写一行原因。
+2. **不误报**。这台机器上 nginx / mysqld 由宝塔直接拉起，systemd 的
+   `nginx.service` / `mysqld.service` 是 LSB 脚本、`is-active` 恒为 inactive，
+   所以存活判定走进程名与端口，不走 systemd（docker 是真 systemd 单元，除外）。
 """
 from __future__ import annotations
 
 import json
 import os
 import socket
+import ssl
 import subprocess
 import time
 import urllib.error
@@ -29,13 +33,21 @@ WB_BASE = os.environ.get("WB_BASE", "http://127.0.0.1:7863")
 
 # 要巡检的站点：(显示名, URL)
 SITES = [
-    ("主站 shiliu153.cn", "https://shiliu153.cn/"),
-    ("主站 shiliu153.me", "https://shiliu153.me/"),
-    ("网关 wb.shiliu153.me", "https://wb.shiliu153.me/healthz"),
+    ("shiliu153.cn (http)", "http://shiliu153.cn/"),
+    ("shiliu153.cn (https)", "https://shiliu153.cn/"),
+    ("shiliu153.me (https)", "https://shiliu153.me/"),
+    ("wb.shiliu153.me (https)", "https://wb.shiliu153.me/healthz"),
 ]
 
-# 要巡检的 systemd 单元
-UNITS = ["nginx", "mysqld", "redis", "docker"]
+# 存活判定走进程名（宝塔托管的服务 systemd 状态不可信）
+PROCESSES = [
+    ("nginx", "nginx"),
+    ("mysqld", "mysqld"),
+    ("redis-server", "redis"),
+]
+
+# 真 systemd 单元
+UNITS = ["docker"]
 
 # 要巡检的本机端口 (端口, 说明)
 PORTS = [
@@ -112,7 +124,10 @@ def collect_host():
     if code == 0 and len(out.splitlines()) >= 2:
         parts = out.splitlines()[1].split()
         if len(parts) >= 5:
-            rows.append(("磁盘 /", "%s / %s (%s)" % (parts[2], parts[1], parts[4])))
+            # df -P 的容量列单位是 1K 块
+            total = int(parts[1]) * 1024
+            used = int(parts[2]) * 1024
+            rows.append(("磁盘 /", "%s / %s (%s)" % (human_bytes(used), human_bytes(total), parts[4])))
     else:
         rows.append(("磁盘 /", "采集失败"))
 
@@ -123,7 +138,10 @@ def collect_host():
                 parts = line.split()
                 total, used, avail = int(parts[1]), int(parts[2]), int(parts[6])
                 rows.append(
-                    ("内存", "%dM / %dM (%.0f%%，可用 %dM)" % (used, total, 100.0 * used / total, avail))
+                    (
+                        "内存",
+                        "%dM / %dM (%.0f%%，可用 %dM)" % (used, total, 100.0 * used / total, avail),
+                    )
                 )
     else:
         rows.append(("内存", "采集失败"))
@@ -144,7 +162,7 @@ def collect_host():
 
     code, out = run(["systemctl", "--failed", "--no-legend", "--no-pager"])
     if code == 0:
-        failed = [l.split()[0] for l in out.splitlines() if l.strip()]
+        failed = [line.split()[0] for line in out.splitlines() if line.strip()]
         rows.append(("失败的 systemd 单元", "无" if not failed else "、".join(failed)))
 
     table(["项目", "值"], rows)
@@ -157,9 +175,14 @@ def collect_services():
     section("二、服务存活")
     rows = []
 
+    for process, label in PROCESSES:
+        code, out = run(["pgrep", "-x", process])
+        count = len([line for line in out.splitlines() if line.strip()]) if code == 0 else 0
+        rows.append((label, "✅ 运行中（%d 个进程）" % count if count else "❌ 未运行"))
+
     for unit in UNITS:
         code, out = run(["systemctl", "is-active", unit])
-        state = out if out else "unknown"
+        state = out or "unknown"
         rows.append((unit, "✅ %s" % state if code == 0 else "❌ %s" % state))
 
     code, out = run(
@@ -206,9 +229,17 @@ def collect_sites():
             rows.append((label, "%s %d" % (mark, code), "%.2fs%s" % (elapsed, extra)))
         except urllib.error.HTTPError as exc:
             rows.append((label, "⚠️ %d" % exc.code, "%.2fs" % (time.time() - started)))
+        except urllib.error.URLError as exc:
+            reason = exc.reason
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                rows.append((label, "⚠️ 证书不匹配", "域名不在证书 SAN 内"))
+            elif isinstance(reason, ssl.SSLError):
+                rows.append((label, "⚠️ TLS 错误", str(reason)[:60]))
+            else:
+                rows.append((label, "❌ 不可达", str(reason)[:60]))
         except Exception as exc:  # noqa: BLE001
-            rows.append((label, "❌ 不可达", "%s" % type(exc).__name__))
-    table(["站点", "状态", "耗时"], rows)
+            rows.append((label, "❌ 不可达", type(exc).__name__))
+    table(["站点", "状态", "备注"], rows)
 
 
 # ---- 四、workbuddy2api 用量 ----------------------------------------------
@@ -242,7 +273,6 @@ def _sum_buckets(buckets):
 def collect_wb():
     section("四、workbuddy2api 用量")
 
-    # 4.1 今日与窗口内合计（来自按小时分桶的 usage.json）
     today = datetime.now().strftime("%Y-%m-%d")
     try:
         with open(str(WB_DIR / "data" / "usage.json"), "r", encoding="utf-8") as fh:
@@ -252,12 +282,12 @@ def collect_wb():
         today_sum = _sum_buckets(today_buckets)
         window_sum = _sum_buckets(buckets)
 
-        def hit_rate(s):
-            denom = s["ch"] + s["cm"]
-            return "%.2f%%" % (100.0 * s["ch"] / denom) if denom else "—"
+        def hit_rate(summary):
+            denom = summary["ch"] + summary["cm"]
+            return "%.2f%%" % (100.0 * summary["ch"] / denom) if denom else "—"
 
         table(
-            ["指标", "今日", "记录窗口内合计"],
+            ["指标", "今日", "累计（本机记录内）"],
             [
                 ("请求数", today_sum["q"], window_sum["q"]),
                 ("错误数", today_sum["e"], window_sum["e"]),
@@ -267,22 +297,18 @@ def collect_wb():
                 ("缓存命中率", hit_rate(today_sum), hit_rate(window_sum)),
             ],
         )
-        print()
-        print("（按小时分桶累加；窗口起点 %s）" % str(usage.get("saved", "?"))[:16])
     except Exception as exc:  # noqa: BLE001
         print("今日用量采集失败：%s: %s" % (type(exc).__name__, exc))
 
-    # 4.2 按账号：余额与累计
     print()
     try:
         status = _wb_get("/status")
-        accounts = status.get("accounts", [])
         rows = []
-        for account in accounts:
+        for account in status.get("accounts", []):
             tokens = account.get("token_usage", {}) or {}
             rows.append(
                 (
-                    account.get("nickname") or account.get("uid", "?")[:8],
+                    account.get("nickname") or str(account.get("uid", "?"))[:8],
                     "%.0f / %.0f" % (account.get("credits", 0), account.get("credits_total", 0)),
                     tokens.get("request_count", 0),
                     human_tokens(tokens.get("total_tokens", 0)),
@@ -299,33 +325,14 @@ def collect_wb():
     except Exception as exc:  # noqa: BLE001
         print("账号状态采集失败：%s: %s" % (type(exc).__name__, exc))
 
-    # 4.3 面板口径的总计
-    print()
-    try:
-        panel = _wb_get("/panel/api/usage")
-        totals = panel.get("totals", {})
-        print(
-            "面板口径：请求 %s，错误 %s，总 tokens %s，缓存命中率 %.2f%%，平均延迟 %.0fms"
-            % (
-                totals.get("requests", "?"),
-                totals.get("errors", "?"),
-                human_tokens(totals.get("total_tokens", 0)),
-                totals.get("cache_hit_rate", 0.0),
-                totals.get("avg_latency_ms", 0.0),
-            )
-        )
-        print("（面板统计窗口起点 %s）" % str(panel.get("since", "?"))[:16])
-    except Exception as exc:  # noqa: BLE001
-        print("面板用量采集失败：%s: %s" % (type(exc).__name__, exc))
 
-
-# ---- 五、请求明细与磁盘占用 ----------------------------------------------
+# ---- 五、请求归档 ---------------------------------------------------------
 
 
 def collect_request_logs():
     section("五、请求归档")
-    today = datetime.now().strftime("%Y-%m-%d")
     log_dir = WB_DIR / "data" / "request-logs"
+    today = datetime.now().strftime("%Y-%m-%d")
     try:
         files = sorted(log_dir.glob("requests-*.jsonl"))
         rows = []
@@ -339,7 +346,10 @@ def collect_request_logs():
         table(["归档文件", "行数", "大小"], rows)
         today_file = log_dir / ("requests-%s.jsonl" % today)
         print()
-        print("今日归档：%s" % ("存在" if today_file.exists() else "尚未生成"))
+        print(
+            "今日归档 requests-%s.jsonl：%s"
+            % (today, "存在" if today_file.exists() else "尚未生成")
+        )
     except Exception as exc:  # noqa: BLE001
         print("请求归档采集失败：%s: %s" % (type(exc).__name__, exc))
 
