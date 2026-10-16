@@ -548,6 +548,90 @@ def collect_credits(getter=None):
     return out or None
 
 
+OPENSSL_DATE_RE = re.compile(r"^([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})")
+
+
+def parse_openssl_date(text):
+    """'Jan  2 09:30:03 2027 GMT' → naive UTC datetime。无法解析 → None。"""
+    m = OPENSSL_DATE_RE.match(str(text or "").strip())
+    if not m or m.group(1) not in MONTH_ABBR:
+        return None
+    return datetime(int(m.group(6)), MONTH_ABBR.index(m.group(1)) + 1, int(m.group(2)),
+                    int(m.group(3)), int(m.group(4)), int(m.group(5)))
+
+
+def collect_backup(root=None, runner=run, now=None):
+    """最新数据库备份的年龄。
+
+    用年龄而非"日期==今天"：日报 22:00 跑、备份 03:30 跑，但凌晨手工重跑时
+    "今天还没备份"是正常的，不该报警。
+    """
+    root = Path(root) if root else BACKUP_ROOT
+    now = now if now is not None else time.time()
+    code, out = runner(["find", str(root), "-type", "f", "-name", "*.gz",
+                        "-printf", "%T@ %s %p\n"])
+    if code != 0:
+        return None
+    newest = None
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        try:
+            mtime, size = float(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if newest is None or mtime > newest[0]:
+            newest = (mtime, size, parts[2])
+    if newest is None:
+        return {"latest": None, "age_hours": None, "ok": False, "size": None}
+    age_hours = (now - newest[0]) / 3600.0
+    return {"latest": datetime.fromtimestamp(newest[0]).strftime("%Y-%m-%dT%H:%M:%S"),
+            "age_hours": round(age_hours, 1),
+            "ok": age_hours <= BACKUP_MAX_AGE_HOURS,
+            "size": newest[1]}
+
+
+CERT_LINE_RE = re.compile(r"^\s*ssl_certificate\s+(\S+?);")
+
+
+def collect_certs(conf_dir=None, runner=run, now=None):
+    """从 nginx vhost 配置里取证书路径，逐个读到期日（剩余天数）。"""
+    conf_dir = Path(conf_dir) if conf_dir else CERT_CONF_DIR
+    now = now if now is not None else time.time()
+    paths = []
+    for conf in sorted(conf_dir.glob("*.conf")):
+        try:
+            text = conf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            m = CERT_LINE_RE.match(line)
+            if m and m.group(1) not in paths:
+                paths.append(m.group(1))
+    if not paths:
+        return None
+
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    result = {}
+    for path in paths:
+        code, out = runner(["openssl", "x509", "-in", path, "-noout", "-enddate", "-subject"])
+        if code != 0:
+            result[path] = None
+            continue
+        domain, enddate = None, None
+        for line in out.splitlines():
+            if line.startswith("notAfter="):
+                enddate = line.split("=", 1)[1].strip()
+            elif line.startswith("subject="):
+                m = re.search(r"CN\s*=\s*([^\s,]+)", line)
+                if m:
+                    domain = m.group(1)
+        expires = parse_openssl_date(enddate) if enddate else None
+        result[domain or path] = (expires.date() - today).days if expires else None
+    return result
+
+
 # ---- main -----------------------------------------------------------------
 
 

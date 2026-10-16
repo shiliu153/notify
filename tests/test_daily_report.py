@@ -578,3 +578,91 @@ class TestCollectCredits(unittest.TestCase):
 
     def test_empty_accounts_returns_none(self):
         self.assertIsNone(report.collect_credits(getter=lambda path: {"accounts": []}))
+
+
+class TestCollectBackup(TempDirTest):
+    NOW = 1800000000.0
+
+    def test_recent_backup_is_ok(self):
+        runner = FakeRunner({"find": (0, "%.2f 44936 /www/backup/database/x/chatapp.sql.gz\n"
+                                      % (self.NOW - 3600))})
+        data = report.collect_backup(root=self.root, runner=runner, now=self.NOW)
+        self.assertTrue(data["ok"])
+        self.assertAlmostEqual(data["age_hours"], 1.0, places=1)
+        self.assertEqual(data["size"], 44936)
+
+    def test_stale_backup_is_not_ok(self):
+        runner = FakeRunner({"find": (0, "%.2f 10 /www/backup/x.sql.gz\n"
+                                      % (self.NOW - 27 * 3600))})
+        data = report.collect_backup(root=self.root, runner=runner, now=self.NOW)
+        self.assertFalse(data["ok"])
+        self.assertAlmostEqual(data["age_hours"], 27.0, places=1)
+
+    def test_exactly_at_the_threshold_is_still_ok(self):
+        runner = FakeRunner({"find": (0, "%.2f 10 /x.sql.gz\n" % (self.NOW - 26 * 3600))})
+        self.assertTrue(report.collect_backup(root=self.root, runner=runner,
+                                             now=self.NOW)["ok"])
+
+    def test_picks_the_newest_of_several(self):
+        runner = FakeRunner({"find": (0, "%.2f 10 /a.sql.gz\n%.2f 20 /b.sql.gz\n"
+                                      % (self.NOW - 50 * 3600, self.NOW - 2 * 3600))})
+        self.assertEqual(report.collect_backup(root=self.root, runner=runner,
+                                              now=self.NOW)["size"], 20)
+
+    def test_no_backup_at_all(self):
+        data = report.collect_backup(root=self.root, runner=FakeRunner({"find": (0, "")}),
+                                     now=self.NOW)
+        self.assertFalse(data["ok"])
+        self.assertIsNone(data["age_hours"])
+        self.assertIsNone(data["latest"])
+
+    def test_find_failure_returns_none(self):
+        self.assertIsNone(report.collect_backup(root=self.root, runner=FakeRunner({})))
+
+
+class TestCollectCerts(TempDirTest):
+    NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    OPENSSL_OK = (0, "notAfter=Jan  2 09:30:03 2027 GMT\nsubject=CN = shiliu153.me\n")
+
+    def conf(self, name, paths):
+        body = "".join("    ssl_certificate     %s;\n" % path for path in paths)
+        return self.write(name, "server {\n%s}\n" % body)
+
+    def test_parses_domain_and_remaining_days(self):
+        self.conf("shiliu153.me.conf", ["/etc/ssl/me/fullchain.pem"])
+        data = report.collect_certs(conf_dir=self.root,
+                                    runner=FakeRunner({"openssl": self.OPENSSL_OK}),
+                                    now=self.NOW)
+        self.assertEqual(data, {"shiliu153.me": 78})
+
+    def test_backup_conf_files_are_ignored(self):
+        self.conf("shiliu153.me.conf.bak.20260918", ["/etc/ssl/old/fullchain.pem"])
+        data = report.collect_certs(conf_dir=self.root,
+                                    runner=FakeRunner({"openssl": self.OPENSSL_OK}),
+                                    now=self.NOW)
+        self.assertIsNone(data)
+
+    def test_duplicate_paths_are_queried_once(self):
+        self.conf("a.conf", ["/etc/ssl/me/fullchain.pem"])
+        self.conf("b.conf", ["/etc/ssl/me/fullchain.pem"])
+        runner = FakeRunner({"openssl": self.OPENSSL_OK})
+        data = report.collect_certs(conf_dir=self.root, runner=runner, now=self.NOW)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(len(runner.calls), 1)
+
+    def test_unreadable_expiry_is_none(self):
+        self.conf("a.conf", ["/etc/ssl/me/fullchain.pem"])
+        data = report.collect_certs(conf_dir=self.root, runner=FakeRunner({"openssl": (1, "")}),
+                                    now=self.NOW)
+        self.assertEqual(list(data.values()), [None])
+
+    def test_no_vhost_conf_returns_none(self):
+        self.assertIsNone(report.collect_certs(conf_dir=self.root, runner=FakeRunner({})))
+
+    def test_parse_openssl_date_handles_padded_day(self):
+        parsed = report.parse_openssl_date("Jan  2 09:30:03 2027 GMT")
+        self.assertEqual(parsed, datetime(2027, 1, 2, 9, 30, 3))
+
+    def test_parse_openssl_date_rejects_junk(self):
+        self.assertIsNone(report.parse_openssl_date("not a date"))
+        self.assertIsNone(report.parse_openssl_date("Xxx  2 09:30:03 2027 GMT"))
