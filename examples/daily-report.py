@@ -632,6 +632,72 @@ def collect_certs(conf_dir=None, runner=run, now=None):
     return result
 
 
+JOURNAL_UNIT_RE = re.compile(r"^\S+\s+\d+\s+\S+\s+\S+\s+([A-Za-z0-9_.@-]+)\[")
+
+
+def collect_journal(runner=run):
+    """按 unit 分类统计 journal 的 err 级日志。
+
+    不按行数报警：这台机器上 84 行里 82 行是 sshd 的公网扫描噪音。
+    """
+    code, out = runner(["journalctl", "--since", "today", "-p", "err", "--no-pager"])
+    if code != 0:
+        return None
+    by_unit = {}
+    total = 0
+    for line in out.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("--"):
+            continue
+        total += 1
+        m = JOURNAL_UNIT_RE.match(stripped)
+        unit = m.group(1) if m else "other"
+        by_unit[unit] = by_unit.get(unit, 0) + 1
+    return {"total": total, "by_unit": by_unit, "sshd_scan": by_unit.get("sshd", 0)}
+
+
+def collect_ssh(log_path=None, today=None):
+    """今日 SSH 登录统计（/var/log/secure）。"""
+    log_path = Path(log_path) if log_path else SECURE_LOG
+    today = today or datetime.now()
+    prefix = month_day_prefix(today)
+    failed = accepted = 0
+    try:
+        with open(str(log_path), "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.startswith(prefix):
+                    continue
+                if "Failed password" in line or "Invalid user" in line:
+                    failed += 1
+                elif "Accepted " in line:
+                    accepted += 1
+    except OSError:
+        return None
+    return {"failed": failed, "accepted": accepted}
+
+
+def collect_nginx_errors(log_dir=None, today=None):
+    """今日 nginx error log 新增行数。
+
+    日期格式是 nginx 自己的 2026/10/16，不是 syslog 的 16/Oct/2026。
+    """
+    log_dir = Path(log_dir) if log_dir else NGINX_LOG_DIR
+    today = today or datetime.now()
+    needle = "%04d/%02d/%02d" % (today.year, today.month, today.day)
+    total = 0
+    files = 0
+    for path in sorted(log_dir.glob("*.error.log")):
+        files += 1
+        try:
+            with open(str(path), "r", encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if needle in line:
+                        total += 1
+        except OSError:
+            continue
+    return {"today_lines": total, "files": files}
+
+
 # ---- main -----------------------------------------------------------------
 
 

@@ -666,3 +666,68 @@ class TestCollectCerts(TempDirTest):
     def test_parse_openssl_date_rejects_junk(self):
         self.assertIsNone(report.parse_openssl_date("not a date"))
         self.assertIsNone(report.parse_openssl_date("Xxx  2 09:30:03 2027 GMT"))
+
+
+class TestCollectJournal(TempDirTest):
+    OUTPUT = ("-- Logs begin at Sun 2025-06-29 15:34:18 CST, end at Fri 2026-10-16 22:53:03 CST. --\n"
+              "Oct 16 00:01:34 host sshd[543183]: error: kex_exchange_identification: read: reset\n"
+              "Oct 16 00:02:57 host sshd[543246]: error: kex_exchange_identification: closed\n"
+              "Oct 16 00:31:50 host systemd-coredump[544379]: Process 544311 (btpython) dumped core.\n"
+              "Oct 16 00:33:32 host systemd-coredump[544499]: Process 544290 (python3.13) dumped core.\n")
+
+    def test_classifies_by_unit(self):
+        data = report.collect_journal(runner=FakeRunner({"journalctl": (0, self.OUTPUT)}))
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(data["sshd_scan"], 2)
+        self.assertEqual(data["by_unit"], {"sshd": 2, "systemd-coredump": 2})
+
+    def test_header_line_is_not_counted_as_other(self):
+        data = report.collect_journal(runner=FakeRunner({"journalctl": (0, self.OUTPUT)}))
+        self.assertNotIn("other", data["by_unit"])
+
+    def test_failure_returns_none(self):
+        self.assertIsNone(report.collect_journal(runner=FakeRunner({})))
+
+
+class TestCollectSsh(TempDirTest):
+    LOG = ("Oct 15 23:59:59 host sshd[1]: Failed password for root from 1.1.1.1 port 1 ssh2\n"
+           "Oct 16 00:01:00 host sshd[2]: Accepted publickey for root from 113.204.50.126\n"
+           "Oct 16 00:02:00 host sshd[3]: Invalid user admin from 2.2.2.2 port 3\n"
+           "Oct 16 00:03:00 host sshd[4]: Failed password for invalid user test from 3.3.3.3\n"
+           "Oct 16 00:04:00 host sshd[5]: error: kex_exchange_identification: closed\n")
+
+    def test_counts_today_only(self):
+        path = self.write("secure", self.LOG)
+        data = report.collect_ssh(log_path=path, today=datetime(2026, 10, 16))
+        self.assertEqual(data["failed"], 2)
+        self.assertEqual(data["accepted"], 1)
+
+    def test_missing_log_returns_none(self):
+        self.assertIsNone(report.collect_ssh(log_path=self.root / "nope",
+                                             today=datetime(2026, 10, 16)))
+
+    def test_single_digit_day_does_not_match_two_digit_day(self):
+        path = self.write("secure", "Oct 16 00:01:00 host sshd[1]: Failed password for root\n")
+        self.assertEqual(report.collect_ssh(log_path=path,
+                                            today=datetime(2026, 10, 1))["failed"], 0)
+
+
+class TestCollectNginxErrors(TempDirTest):
+    def test_counts_only_today(self):
+        self.write("a.error.log",
+                   "2026/10/15 10:00:00 [error] old\n"
+                   "2026/10/16 10:00:00 [error] new\n"
+                   "2026/10/16 11:00:00 [error] newer\n")
+        data = report.collect_nginx_errors(log_dir=self.root, today=datetime(2026, 10, 16))
+        self.assertEqual(data["today_lines"], 2)
+        self.assertEqual(data["files"], 1)
+
+    def test_non_error_logs_are_ignored(self):
+        self.write("access.log", "2026/10/16 10:00:00 stuff\n")
+        data = report.collect_nginx_errors(log_dir=self.root, today=datetime(2026, 10, 16))
+        self.assertEqual(data, {"today_lines": 0, "files": 0})
+
+    def test_missing_directory(self):
+        data = report.collect_nginx_errors(log_dir=self.root / "nope",
+                                           today=datetime(2026, 10, 16))
+        self.assertEqual(data, {"today_lines": 0, "files": 0})
