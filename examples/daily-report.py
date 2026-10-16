@@ -362,20 +362,7 @@ def backfill_snapshot(path, log_dir, today):
         return 0
 
 
-def section(title):
-    print()
-    print("## %s" % title)
-    print()
-
-
-def table(headers, rows):
-    print("| " + " | ".join(headers) + " |")
-    print("|" + "|".join([" --- "] * len(headers)) + "|")
-    for row in rows:
-        print("| " + " | ".join(str(c) for c in row) + " |")
-
-
-# ---- 一、主机 -------------------------------------------------------------
+# ---- 采集层 ---------------------------------------------------------------
 
 
 def probe_port(port):
@@ -542,96 +529,23 @@ def _wb_get(path):
         return json.loads(response.read().decode("utf-8"))
 
 
-def _sum_buckets(buckets):
-    totals = {"q": 0, "e": 0, "p": 0, "c": 0, "t": 0, "ch": 0, "cm": 0}
-    for bucket in buckets:
-        for key in totals:
-            totals[key] += bucket.get(key, 0) or 0
-    return totals
+def collect_requests(log_dir=None, today=None):
+    """今日请求质量（单一来源：requests-<today>.jsonl）。"""
+    log_dir = Path(log_dir) if log_dir else REQUEST_LOG_DIR
+    today = today or datetime.now().strftime("%Y-%m-%d")
+    rows, _bad = read_jsonl(log_dir / ("requests-%s.jsonl" % today))
+    return requests_metrics(rows)
 
 
-def collect_wb():
-    section("四、workbuddy2api 用量")
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    try:
-        with open(str(WB_DIR / "data" / "usage.json"), "r", encoding="utf-8") as fh:
-            usage = json.load(fh)
-        buckets = usage.get("buckets", [])
-        today_buckets = [b for b in buckets if str(b.get("s", "")).startswith("h:" + today)]
-        today_sum = _sum_buckets(today_buckets)
-        window_sum = _sum_buckets(buckets)
-
-        def hit_rate(summary):
-            denom = summary["ch"] + summary["cm"]
-            return "%.2f%%" % (100.0 * summary["ch"] / denom) if denom else "—"
-
-        table(
-            ["指标", "今日", "累计（本机记录内）"],
-            [
-                ("请求数", today_sum["q"], window_sum["q"]),
-                ("错误数", today_sum["e"], window_sum["e"]),
-                ("prompt tokens", human_tokens(today_sum["p"]), human_tokens(window_sum["p"])),
-                ("completion tokens", human_tokens(today_sum["c"]), human_tokens(window_sum["c"])),
-                ("总 tokens", human_tokens(today_sum["t"]), human_tokens(window_sum["t"])),
-                ("缓存命中率", hit_rate(today_sum), hit_rate(window_sum)),
-            ],
-        )
-    except Exception as exc:  # noqa: BLE001
-        print("今日用量采集失败：%s: %s" % (type(exc).__name__, exc))
-
-    print()
-    try:
-        status = _wb_get("/status")
-        rows = []
-        for account in status.get("accounts", []):
-            tokens = account.get("token_usage", {}) or {}
-            rows.append(
-                (
-                    account.get("nickname") or str(account.get("uid", "?"))[:8],
-                    "%.0f / %.0f" % (account.get("credits", 0), account.get("credits_total", 0)),
-                    tokens.get("request_count", 0),
-                    human_tokens(tokens.get("total_tokens", 0)),
-                    account.get("success_count", 0),
-                    account.get("err_total", 0),
-                    "是" if account.get("cooling") else "否",
-                    "是" if account.get("disabled") else "否",
-                )
-            )
-        table(
-            ["账号", "余额/总额", "累计请求", "累计 tokens", "成功", "失败", "冷却中", "已禁用"],
-            rows,
-        )
-    except Exception as exc:  # noqa: BLE001
-        print("账号状态采集失败：%s: %s" % (type(exc).__name__, exc))
-
-
-# ---- 五、请求归档 ---------------------------------------------------------
-
-
-def collect_request_logs():
-    section("五、请求归档")
-    log_dir = WB_DIR / "data" / "request-logs"
-    today = datetime.now().strftime("%Y-%m-%d")
-    try:
-        files = sorted(log_dir.glob("requests-*.jsonl"))
-        rows = []
-        for path in files[-5:]:
-            try:
-                with open(str(path), "r", encoding="utf-8", errors="replace") as fh:
-                    lines = sum(1 for _ in fh)
-            except Exception:
-                lines = -1
-            rows.append((path.name, lines, human_bytes(path.stat().st_size)))
-        table(["归档文件", "行数", "大小"], rows)
-        today_file = log_dir / ("requests-%s.jsonl" % today)
-        print()
-        print(
-            "今日归档 requests-%s.jsonl：%s"
-            % (today, "存在" if today_file.exists() else "尚未生成")
-        )
-    except Exception as exc:  # noqa: BLE001
-        print("请求归档采集失败：%s: %s" % (type(exc).__name__, exc))
+def collect_credits(getter=None):
+    """账号余额（来自 workbuddy2api 的 /status）。"""
+    getter = getter or _wb_get
+    status = getter("/status")
+    out = {}
+    for account in (status.get("accounts") or []):
+        name = account.get("nickname") or str(account.get("uid", "?"))[:8]
+        out[name] = {"left": account.get("credits"), "total": account.get("credits_total")}
+    return out or None
 
 
 # ---- main -----------------------------------------------------------------

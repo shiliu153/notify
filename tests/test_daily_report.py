@@ -536,3 +536,45 @@ class TestCollectSites(TempDirTest):
         me = [r for r in rows if r["label"] == "shiliu153.me (https)"][0]
         self.assertEqual(me["code"], 502)
         self.assertFalse(me["ok"])
+
+
+class TestCollectRequests(TempDirTest):
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(report.collect_requests(log_dir=self.root, today="2026-10-16"))
+
+    def test_all_bad_lines_returns_none(self):
+        self.write("requests-2026-10-16.jsonl", "garbage\n")
+        self.assertIsNone(report.collect_requests(log_dir=self.root, today="2026-10-16"))
+
+    def test_reads_todays_file(self):
+        self.write("requests-2026-10-16.jsonl",
+                   json.dumps({"time": "2026-10-16T09:00:00+08:00", "duration_ms": 120,
+                               "ttfb_ms": 60, "ok": True, "status": 200, "attempts": 1,
+                               "total_tokens": 10, "cache_hit_tokens": 1,
+                               "cache_miss_tokens": 1}) + "\n")
+        metrics = report.collect_requests(log_dir=self.root, today="2026-10-16")
+        self.assertEqual(metrics["count"], 1)
+        self.assertEqual(metrics["p50"], 120)
+
+    def test_other_days_are_not_read(self):
+        self.write("requests-2026-10-15.jsonl", "{}\n")
+        self.assertIsNone(report.collect_requests(log_dir=self.root, today="2026-10-16"))
+
+
+class TestCollectCredits(unittest.TestCase):
+    def test_reads_accounts(self):
+        def getter(path):
+            self.assertEqual(path, "/status")
+            return {"accounts": [{"nickname": "shiliu655", "credits": 364, "credits_total": 470}]}
+
+        self.assertEqual(report.collect_credits(getter=getter),
+                         {"shiliu655": {"left": 364, "total": 470}})
+
+    def test_falls_back_to_uid_prefix(self):
+        def getter(path):
+            return {"accounts": [{"uid": "02382e91-ef33", "credits": 1, "credits_total": 2}]}
+
+        self.assertEqual(list(report.collect_credits(getter=getter)), ["02382e91"])
+
+    def test_empty_accounts_returns_none(self):
+        self.assertIsNone(report.collect_credits(getter=lambda path: {"accounts": []}))
