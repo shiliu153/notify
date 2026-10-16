@@ -60,3 +60,12 @@ bin/notify log -n 20                  # 看最近投递记录
 - **535 认证失败**：DirectMail 的 SMTP 密码或 QQ 授权码不对；QQ 必须用授权码而不是登录密码。
 - **没有任何就绪通道**：`/etc/notify/env` 里的变量名要和配置里的 `password_env` 完全一致，且 cron 走 `bin/notify`（它会 source 该文件）。
 - **重复发送**：给日报脚本固定传 `--dedup-key daily-digest`。
+
+## 待人工验证
+
+自动化测试不真发信。首次部署后请依次执行并确认结果：
+
+1. `bin/notify doctor` —— 端口可达、DNS 记录齐备；
+2. `bin/notify test` —— 两个通道各收到一封自检邮件（首封可能进垃圾箱，手动标非垃圾并加白名单）；
+3. `bin/notify send --title "日报" --body-file <真实日报文件> --dedup-key daily-digest` —— 确认 HTML 排版正常、中文不乱码；
+4. 再跑一次同一条命令 —— 应返回退出码 3 且不重复发信。
