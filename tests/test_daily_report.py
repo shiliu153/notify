@@ -208,3 +208,72 @@ class TestKnownIssues(unittest.TestCase):
 
     def test_no_reason_when_not_matching(self):
         self.assertIsNone(report.known_reason("shiliu153.me (https)", "证书不匹配"))
+
+
+class TestRequestsMetrics(TempDirTest):
+    def sample_rows(self):
+        return [
+            {"time": "2026-10-16T09:05:00.1+08:00", "account": "a(1)", "model": "m1",
+             "status": 200, "ok": True, "outcome": "success", "duration_ms": 100,
+             "ttfb_ms": 50, "attempts": 1, "total_tokens": 1000,
+             "cache_hit_tokens": 900, "cache_miss_tokens": 100,
+             "client_ip": "1.1.1.1", "user_agent": "ua1"},
+            {"time": "2026-10-16T09:30:00.2+08:00", "account": "b(2)", "model": "m1",
+             "status": 200, "ok": True, "outcome": "success", "duration_ms": 300,
+             "ttfb_ms": 70, "attempts": 2, "total_tokens": 2000,
+             "cache_hit_tokens": 0, "cache_miss_tokens": 2000,
+             "client_ip": "1.1.1.1", "user_agent": "ua2"},
+            {"time": "2026-10-16T14:10:00.3+08:00", "account": "a(1)", "model": "m2",
+             "status": 502, "ok": False, "outcome": "upstream_error", "duration_ms": 900,
+             "ttfb_ms": 800, "attempts": 1, "total_tokens": 0,
+             "cache_hit_tokens": 0, "cache_miss_tokens": 0,
+             "client_ip": "2.2.2.2", "user_agent": "ua1"},
+        ]
+
+    def test_empty_rows_returns_none(self):
+        self.assertIsNone(report.requests_metrics([]))
+
+    def test_counts_and_failures(self):
+        m = report.requests_metrics(self.sample_rows())
+        self.assertEqual(m["count"], 3)
+        self.assertEqual(m["failed"], 1)
+        self.assertEqual(m["retries"], 1)
+
+    def test_percentiles_and_max(self):
+        m = report.requests_metrics(self.sample_rows())
+        self.assertEqual(m["p50"], 300)
+        self.assertEqual(m["p99"], 900)
+        self.assertEqual(m["max"], 900)
+        self.assertEqual(m["ttfb_p50"], 70)
+
+    def test_tokens_and_cache(self):
+        m = report.requests_metrics(self.sample_rows())
+        self.assertEqual(m["tokens_total"], 3000)
+        self.assertEqual(m["cache_hit_pct"], round(100.0 * 900 / 3000, 2))
+
+    def test_zero_cache_denominator_is_none(self):
+        m = report.requests_metrics([{"duration_ms": 1, "cache_hit_tokens": 0,
+                                      "cache_miss_tokens": 0}])
+        self.assertIsNone(m["cache_hit_pct"])
+
+    def test_distributions(self):
+        m = report.requests_metrics(self.sample_rows())
+        self.assertEqual(m["by_account"], {"a": 2, "b": 1})
+        self.assertEqual(m["by_model"], {"m1": 2, "m2": 1})
+        self.assertEqual(m["by_ip"], {"1.1.1.1": 2, "2.2.2.2": 1})
+        self.assertEqual(m["by_ua"], {"ua1": 2, "ua2": 1})
+
+    def test_peak_hour_and_slowest(self):
+        m = report.requests_metrics(self.sample_rows())
+        self.assertEqual(m["peak_hour"], 9)
+        self.assertEqual(m["peak_hour_count"], 2)
+        self.assertEqual(m["slowest"]["account"], "a")
+        self.assertEqual(m["slowest"]["hhmm"], "14:10")
+        self.assertEqual(m["slowest"]["ms"], 900)
+
+    def test_missing_fields_do_not_crash(self):
+        m = report.requests_metrics([{}])
+        self.assertEqual(m["count"], 1)
+        self.assertEqual(m["failed"], 0)
+        self.assertIsNone(m["peak_hour"])
+        self.assertEqual(m["slowest"]["hhmm"], "—")

@@ -185,6 +185,63 @@ def is_known_issue(label, note):
     return known_reason(label, note) is not None
 
 
+ISO_HOUR_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})")
+
+
+def _hour_of(row):
+    m = ISO_HOUR_RE.match(str(row.get("time") or ""))
+    return int(m.group(4)) if m else None
+
+
+def _hhmm_of(row):
+    m = ISO_HOUR_RE.match(str(row.get("time") or ""))
+    return "%s:%s" % (m.group(4), m.group(5)) if m else "—"
+
+
+def _account_name(row):
+    """'shiliu153(69737e40)' → 'shiliu153'。"""
+    return str(row.get("account") or "?").split("(")[0]
+
+
+def requests_metrics(rows):
+    """把 requests-*.jsonl 的行汇总成日报指标。rows 为空 → None。"""
+    if not rows:
+        return None
+    durations = [int(r.get("duration_ms") or 0) for r in rows]
+    ttfbs = [int(r.get("ttfb_ms") or 0) for r in rows]
+    failed = sum(1 for r in rows if r.get("ok") is False or (r.get("status") or 0) >= 400)
+    retries = sum(1 for r in rows if (r.get("attempts") or 1) > 1)
+    tokens_total = sum(int(r.get("total_tokens") or 0) for r in rows)
+    hit = sum(int(r.get("cache_hit_tokens") or 0) for r in rows)
+    miss = sum(int(r.get("cache_miss_tokens") or 0) for r in rows)
+
+    hours = collections.Counter(h for h in (_hour_of(r) for r in rows) if h is not None)
+    peak_hour, peak_count = hours.most_common(1)[0] if hours else (None, 0)
+    slowest = max(rows, key=lambda r: int(r.get("duration_ms") or 0))
+
+    return {
+        "count": len(rows),
+        "failed": failed,
+        "p50": percentile(durations, 0.5),
+        "p90": percentile(durations, 0.9),
+        "p99": percentile(durations, 0.99),
+        "max": max(durations),
+        "ttfb_p50": percentile(ttfbs, 0.5),
+        "ttfb_p90": percentile(ttfbs, 0.9),
+        "retries": retries,
+        "tokens_total": tokens_total,
+        "cache_hit_pct": round(100.0 * hit / (hit + miss), 2) if (hit + miss) else None,
+        "by_account": dict(collections.Counter(_account_name(r) for r in rows)),
+        "by_model": dict(collections.Counter(str(r.get("model") or "?") for r in rows)),
+        "by_ip": dict(collections.Counter(str(r.get("client_ip") or "?") for r in rows)),
+        "by_ua": dict(collections.Counter(str(r.get("user_agent") or "?") for r in rows)),
+        "peak_hour": peak_hour,
+        "peak_hour_count": peak_count,
+        "slowest": {"account": _account_name(slowest), "hhmm": _hhmm_of(slowest),
+                    "ms": int(slowest.get("duration_ms") or 0)},
+    }
+
+
 def section(title):
     print()
     print("## %s" % title)
