@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+# 密钥与本地状态绝不入库
+*.env
+config.ini
+*.db
+*.jsonl
