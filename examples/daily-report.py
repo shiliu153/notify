@@ -325,6 +325,43 @@ def daily_consumption(base_row, today_row):
     return out
 
 
+BACKFILL_LOG_RE = re.compile(r"^requests-(\d{4}-\d{2}-\d{2})\.jsonl$")
+
+
+def backfill_snapshot(path, log_dir, today):
+    """把 jsonl 覆盖、但快照里没有的日期补成快照行。
+
+    只填 requests 字段，其余留 null；已存在的日期不覆盖。返回新增行数。
+    """
+    try:
+        log_dir = Path(log_dir)
+        rows = load_snapshot(path)
+        known = {str(r.get("date")) for r in rows}
+        added = 0
+        for log_path in sorted(log_dir.glob("requests-*.jsonl")):
+            m = BACKFILL_LOG_RE.match(log_path.name)
+            if not m:
+                continue
+            day = m.group(1)
+            if day >= today or day in known:
+                continue
+            raw, _bad = read_jsonl(log_path)
+            metrics = requests_metrics(raw)
+            if metrics is None:
+                continue
+            rows.append({"date": day, "ts": None, "host": None, "services": None, "sites": None,
+                         "requests": metrics, "credits": None, "certs": None, "backup": None,
+                         "system": None, "hard_failures": [], "backfill": True})
+            known.add(day)
+            added += 1
+        if added:
+            _write_snapshot_rows(rows, path)
+        return added
+    except Exception as exc:  # noqa: BLE001 - 回填失败不得影响日报
+        print("快照回填失败：%s: %s" % (type(exc).__name__, exc))
+        return 0
+
+
 def section(title):
     print()
     print("## %s" % title)

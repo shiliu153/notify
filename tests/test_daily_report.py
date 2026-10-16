@@ -364,3 +364,64 @@ class TestSnapshot(TempDirTest):
 
     def test_daily_consumption_without_base(self):
         self.assertEqual(report.daily_consumption(None, self.row("2026-10-16")), {})
+
+
+class TestBackfill(TempDirTest):
+    def setUp(self):
+        super().setUp()
+        self.path = self.root / "daily-stats.jsonl"
+        self.log_dir = self.root / "request-logs"
+        self.log_dir.mkdir()
+
+    def log(self, day, count):
+        lines = "".join(
+            json.dumps({"time": "%sT10:0%d:00+08:00" % (day, index), "duration_ms": 100,
+                        "ttfb_ms": 40, "total_tokens": 10, "cache_hit_tokens": 1,
+                        "cache_miss_tokens": 0, "ok": True, "status": 200, "attempts": 1}) + "\n"
+            for index in range(count))
+        self.write("request-logs/requests-%s.jsonl" % day, lines)
+
+    def test_backfills_every_missing_day(self):
+        self.log("2026-10-14", 2)
+        self.log("2026-10-15", 3)
+        added = report.backfill_snapshot(self.path, self.log_dir, "2026-10-16")
+        self.assertEqual(added, 2)
+        rows = report.load_snapshot(self.path)
+        self.assertEqual([r["date"] for r in rows], ["2026-10-14", "2026-10-15"])
+        self.assertEqual(rows[1]["requests"]["count"], 3)
+
+    def test_backfilled_rows_are_marked_and_the_rest_is_null(self):
+        self.log("2026-10-15", 1)
+        report.backfill_snapshot(self.path, self.log_dir, "2026-10-16")
+        row = report.load_snapshot(self.path)[0]
+        self.assertTrue(row["backfill"])
+        self.assertIsNone(row["credits"])
+        self.assertIsNone(row["host"])
+
+    def test_existing_days_are_not_overwritten(self):
+        report.save_snapshot({"date": "2026-10-15", "requests": {"count": 99}, "backfill": False},
+                             self.path, "2026-10-15")
+        self.log("2026-10-15", 3)
+        self.assertEqual(report.backfill_snapshot(self.path, self.log_dir, "2026-10-16"), 0)
+        self.assertEqual(report.load_snapshot(self.path)[0]["requests"]["count"], 99)
+
+    def test_today_is_never_backfilled(self):
+        self.log("2026-10-16", 1)
+        self.assertEqual(report.backfill_snapshot(self.path, self.log_dir, "2026-10-16"), 0)
+
+    def test_backfilled_rows_do_not_feed_the_credit_baseline(self):
+        self.log("2026-10-15", 1)
+        report.backfill_snapshot(self.path, self.log_dir, "2026-10-16")
+        self.assertIsNone(report.find_credit_base(report.load_snapshot(self.path), "2026-10-16"))
+
+    def test_missing_log_dir_is_a_noop(self):
+        self.assertEqual(report.backfill_snapshot(self.path, self.root / "nope", "2026-10-16"), 0)
+
+    def test_is_idempotent(self):
+        self.log("2026-10-15", 1)
+        report.backfill_snapshot(self.path, self.log_dir, "2026-10-16")
+        self.assertEqual(report.backfill_snapshot(self.path, self.log_dir, "2026-10-16"), 0)
+
+    def test_unrelated_file_names_are_ignored(self):
+        self.write("request-logs/requests-broken.jsonl", "{}\n")
+        self.assertEqual(report.backfill_snapshot(self.path, self.log_dir, "2026-10-16"), 0)
