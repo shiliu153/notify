@@ -837,3 +837,162 @@ class TestHardFailures(TempDirTest):
         metrics = self.green()
         metrics["sites"].append({"label": "shiliu153.cn (https)", "ok": False, "known": True})
         self.assertEqual(report.count_known(metrics), 1)
+
+
+def green_history():
+    return {"today": "2026-10-16", "yesterday": None, "credit_base": None, "credit_gap_days": 0}
+
+
+class TestRenderConclusion(unittest.TestCase):
+    def test_green_without_known_issues(self):
+        self.assertEqual(report.render_conclusion(green_metrics(), []),
+                         "✅ 无硬故障 ｜ 20 项巡检")
+
+    def test_green_with_a_known_issue(self):
+        metrics = green_metrics()
+        metrics["sites"].append({"label": "shiliu153.cn (https)", "ok": False, "known": True})
+        self.assertEqual(report.render_conclusion(metrics, []),
+                         "✅ 无硬故障 ｜ 20 项巡检（1 项已知）")
+
+    def test_with_hard_failures(self):
+        self.assertEqual(report.render_conclusion(green_metrics(), ["a", "b"]),
+                         "❌ 2 项硬故障")
+
+
+class TestRenderHardChecks(unittest.TestCase):
+    def test_rows_present(self):
+        text = "\n".join(report.render_hard_checks(green_metrics(), []))
+        self.assertIn("## 一、硬故障巡检", text)
+        self.assertIn("| 进程 · 端口 · 容器 | 4 / 4 正常 |", text)
+        self.assertIn("| 站点可用性 | 1 / 1 可达（0 项已知） |", text)
+        self.assertIn("| 磁盘 / | 45%（阈值 90%） |", text)
+        self.assertIn("2026-10-16 03:30", text)
+        self.assertIn("shiliu153.me 剩 78 天", text)
+
+    def test_failures_are_listed_first(self):
+        text = "\n".join(report.render_hard_checks(green_metrics(), ["磁盘 / 已用 95%（阈值 90%）"]))
+        self.assertIn("- ❌ 磁盘 / 已用 95%（阈值 90%）", text)
+
+    def test_known_issue_note(self):
+        metrics = green_metrics()
+        metrics["sites"] = [{"label": "shiliu153.cn (https)", "url": "https://shiliu153.cn/",
+                             "ok": False, "note": "证书不匹配", "known": True,
+                             "known_reason": ".cn 正在备案中，暂不处理证书"}]
+        text = "\n".join(report.render_hard_checks(metrics, []))
+        self.assertIn("已知项（不报警）", text)
+        self.assertIn(".cn 正在备案中，暂不处理证书", text)
+
+    def test_collection_failure_is_labelled(self):
+        metrics = green_metrics()
+        metrics["host"] = None
+        metrics["backup"] = None
+        text = "\n".join(report.render_hard_checks(metrics, []))
+        self.assertIn("采集失败", text)
+
+
+class TestRenderRequests(unittest.TestCase):
+    def test_today_only_when_no_yesterday(self):
+        text = "\n".join(report.render_requests(green_metrics(), green_history()))
+        self.assertIn("### 请求质量（今日 285 次）", text)
+        self.assertIn("| 请求数 | 285 | — | — |", text)
+        self.assertIn("6.9s / 14.7s / 59.1s", text)
+        self.assertIn("3.1s / 4.2s", text)
+        self.assertIn("最慢一条：94.4s（shiliu12318，16:14）", text)
+        self.assertIn("峰值时段：14:00–15:00（62 次）", text)
+
+    def test_delta_against_yesterday(self):
+        history = green_history()
+        yesterday = green_metrics()["requests"]
+        yesterday["count"] = 120
+        history["yesterday"] = {"requests": yesterday}
+        text = "\n".join(report.render_requests(green_metrics(), history))
+        self.assertIn("| 请求数 | 285 | 120 | +138% |", text)
+
+    def test_missing_today(self):
+        metrics = green_metrics()
+        metrics["requests"] = None
+        text = "\n".join(report.render_requests(metrics, green_history()))
+        self.assertIn("尚未生成或采集失败", text)
+
+
+class TestRenderCredits(unittest.TestCase):
+    def test_no_history_says_so(self):
+        text = "\n".join(report.render_credits(green_metrics(), green_history()))
+        self.assertIn("| 账号 | 余额 | 日均消耗 | 可撑天数 |", text)
+        self.assertIn("| shiliu12318 | 409 / 410 | — | — |", text)
+        self.assertIn("明天起可用", text)
+
+    def test_sorted_by_days_left_ascending(self):
+        metrics = green_metrics()
+        metrics["credits"] = {"rich": {"left": 409, "total": 410},
+                              "tight": {"left": 30, "total": 470},
+                              "middle": {"left": 100, "total": 470}}
+        history = green_history()
+        history["credit_base"] = {"date": "2026-10-10",
+                                  "credits": {"rich": {"left": 409}, "tight": {"left": 90},
+                                              "middle": {"left": 160}}}
+        history["credit_gap_days"] = 6
+        lines = report.render_credits(metrics, history)
+        rows = [line for line in lines if line.startswith("| ") and "账号" not in line
+                and "---" not in line]
+        self.assertIn("tight", rows[0])
+        self.assertIn("middle", rows[1])
+        self.assertIn("rich", rows[2])
+
+    def test_collection_failure(self):
+        metrics = green_metrics()
+        metrics["credits"] = None
+        self.assertIn("账号余额采集失败", "\n".join(report.render_credits(metrics, green_history())))
+
+
+class TestRenderSystem(unittest.TestCase):
+    def test_lines(self):
+        text = "\n".join(report.render_system(green_metrics(), green_history(), {}))
+        self.assertIn("内存 57%", text)
+        self.assertIn("负载 0.13 / 0.17 / 0.11", text)
+        self.assertIn("journal 错误 84 行：sshd 82 ｜ systemd-coredump 2", text)
+        self.assertIn("nginx error log 今日 1 行", text)
+        self.assertIn("SSH：失败 2 次 ｜ 成功 74 次", text)
+        self.assertIn("运行时长：28 天 5 小时", text)
+
+    def test_yesterday_memory(self):
+        history = green_history()
+        history["yesterday"] = {"host": {"mem_pct": 61}}
+        self.assertIn("内存 57%（昨日 61%）",
+                      "\n".join(report.render_system(green_metrics(), history, {})))
+
+    def test_failed_sections_are_listed(self):
+        text = "\n".join(report.render_system(green_metrics(), green_history(),
+                                             {"host": "RuntimeError: df 挂了"}))
+        self.assertIn("采集失败的节：host", text)
+
+    def test_collection_failures_are_labelled(self):
+        metrics = green_metrics()
+        metrics["host"] = None
+        metrics["journal"] = None
+        metrics["ssh"] = None
+        metrics["nginx_errors"] = None
+        text = "\n".join(report.render_system(metrics, green_history(), {}))
+        self.assertIn("内存 采集失败", text)
+        self.assertIn("journal 错误 采集失败", text)
+        self.assertIn("nginx error log 今日 采集失败 行", text)
+
+
+class TestRender(unittest.TestCase):
+    def test_full_document(self):
+        text = report.render(green_metrics(), green_history(), [], {}, hostname="testhost")
+        self.assertTrue(text.startswith("# 服务器日报 "))
+        self.assertIn("✅ 无硬故障 ｜ 20 项巡检", text)
+        self.assertIn("主机 testhost", text)
+        self.assertIn("## 一、硬故障巡检", text)
+        self.assertIn("## 二、运营明细", text)
+        self.assertIn("### 请求质量", text)
+        self.assertIn("### 额度", text)
+        self.assertIn("### 系统", text)
+        self.assertIn("由 notify + daily-report.py 自动生成", text)
+
+    def test_table_columns_never_exceed_four(self):
+        text = report.render(green_metrics(), green_history(), [], {}, hostname="testhost")
+        for line in text.splitlines():
+            if line.startswith("|") and "---" not in line:
+                self.assertLessEqual(line.count("|") - 1, 4, "表格列数超过 4：%s" % line)

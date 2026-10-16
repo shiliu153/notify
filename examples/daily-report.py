@@ -771,6 +771,278 @@ def hard_failures(metrics):
     return problems
 
 
+def table_lines(headers, rows):
+    """markdown 表格行（不打印）。"""
+    out = ["| " + " | ".join(str(h) for h in headers) + " |",
+           "|" + "|".join([" --- "] * len(headers)) + "|"]
+    for row in rows:
+        out.append("| " + " | ".join(str(c) for c in row) + " |")
+    return out
+
+
+def backup_line(backup):
+    """第一节的备份现状。"""
+    if not backup:
+        return "采集失败"
+    if backup.get("age_hours") is None:
+        return "❌ 找不到任何备份"
+    mark = "✅" if backup["ok"] else "❌"
+    when = str(backup.get("latest") or "")[:16].replace("T", " ")
+    return "%s %s（%s，阈值 %d 小时）" % (mark, when,
+                                        human_bytes(backup.get("size") or 0),
+                                        BACKUP_MAX_AGE_HOURS)
+
+
+def certs_line(certs):
+    """第一节的证书现状。"""
+    if not certs:
+        return "采集失败"
+    parts = ["%s 剩 %s 天" % (domain, days if days is not None else "?")
+             for domain, days in sorted(certs.items())]
+    return " ｜ ".join(parts) + "（阈值 %d 天）" % CERT_HARD_DAYS
+
+
+def render_conclusion(metrics, problems):
+    """顶部那一行结论。"""
+    if problems:
+        return "❌ %d 项硬故障" % len(problems)
+    total = count_checks(len(metrics.get("certs") or {}))
+    known = count_known(metrics)
+    if known:
+        return "✅ 无硬故障 ｜ %d 项巡检（%d 项已知）" % (total, known)
+    return "✅ 无硬故障 ｜ %d 项巡检" % total
+
+
+def render_hard_checks(metrics, problems):
+    """第一节：硬故障巡检。"""
+    lines = ["## 一、硬故障巡检", ""]
+    if problems:
+        lines.append("**硬故障**")
+        lines.append("")
+        for problem in problems:
+            lines.append("- ❌ %s" % problem)
+        lines.append("")
+
+    ok, total = count_service_checks(metrics)
+    sites = metrics.get("sites") or []
+    host = metrics.get("host") or {}
+    sites_ok = sum(1 for site in sites if site.get("ok"))
+    rows = [
+        ("进程 · 端口 · 容器", "%d / %d 正常" % (ok, total) if total else "采集失败"),
+        ("站点可用性", "%d / %d 可达（%d 项已知）" % (sites_ok, len(sites), count_known(metrics))
+            if sites else "采集失败"),
+        ("磁盘 /", "%d%%（阈值 %d%%）" % (host["disk_pct"], DISK_HARD_PCT)
+            if host.get("disk_pct") is not None else "采集失败"),
+        ("MySQL 备份", backup_line(metrics.get("backup"))),
+        ("站点证书", certs_line(metrics.get("certs"))),
+    ]
+    lines.extend(table_lines(["判据", "现状"], rows))
+
+    known = [site for site in sites if site.get("known")]
+    if known:
+        lines.append("")
+        lines.append("> 已知项（不报警）：%s"
+                     % "；".join("%s %s —— %s" % (site["url"], site["note"], site["known_reason"])
+                                 for site in known))
+    return lines
+
+
+def _human_or_dash(value):
+    return "—" if value is None else human_tokens(value)
+
+
+def _ms(value):
+    return "—" if value is None else "%.1fs" % (value / 1000.0)
+
+
+def _pct(value):
+    return "—" if value is None else "%.2f%%" % value
+
+
+def _dist(counts, limit=3):
+    if not counts:
+        return "—"
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:limit]
+    return " ｜ ".join("%s %d" % (name, count) for name, count in items)
+
+
+def _yesterday_requests(history):
+    return (history.get("yesterday") or {}).get("requests") or {}
+
+
+def render_requests(metrics, history):
+    """运营明细：请求质量。"""
+    lines = []
+    today = metrics.get("requests")
+    if not today:
+        lines.append("### 请求质量")
+        lines.append("")
+        lines.append("今日请求归档尚未生成或采集失败。")
+        return lines
+
+    yesterday = _yesterday_requests(history)
+    lines.append("### 请求质量（今日 %d 次）" % today["count"])
+    lines.append("")
+    rows = [
+        ("请求数", today["count"], yesterday.get("count", "—"),
+         delta(today["count"], yesterday.get("count"))),
+        ("失败数", today["failed"], yesterday.get("failed", "—"),
+         delta(today["failed"], yesterday.get("failed"))),
+        ("延迟 P50 / P90 / P99",
+         "%s / %s / %s" % (_ms(today["p50"]), _ms(today["p90"]), _ms(today["p99"])),
+         "%s / %s / %s" % (_ms(yesterday.get("p50")), _ms(yesterday.get("p90")),
+                           _ms(yesterday.get("p99"))), "—"),
+        ("TTFB P50 / P90", "%s / %s" % (_ms(today["ttfb_p50"]), _ms(today["ttfb_p90"])),
+         "%s / %s" % (_ms(yesterday.get("ttfb_p50")), _ms(yesterday.get("ttfb_p90"))), "—"),
+        ("重试", "%d 次（%.2f%%）" % (today["retries"],
+                                    100.0 * today["retries"] / today["count"]),
+         yesterday.get("retries", "—"),
+         delta(today["retries"], yesterday.get("retries"))),
+        ("总 tokens", human_tokens(today["tokens_total"]),
+         _human_or_dash(yesterday.get("tokens_total")),
+         delta(today["tokens_total"], yesterday.get("tokens_total"))),
+        ("缓存命中率", _pct(today["cache_hit_pct"]), _pct(yesterday.get("cache_hit_pct")), "—"),
+    ]
+    lines.extend(table_lines(["指标", "今日", "昨日", "变化"], rows))
+    lines.append("")
+
+    slowest = today["slowest"]
+    lines.append("- 最慢一条：%s（%s，%s）" % (_ms(slowest["ms"]), slowest["account"],
+                                              slowest["hhmm"]))
+    lines.append("- 账号：%s" % _dist(today["by_account"]))
+    lines.append("- 模型：%s" % _dist(today["by_model"]))
+    lines.append("- 来源：%s（%s）" % (_dist(today["by_ip"]), _dist(today["by_ua"])))
+    if today.get("peak_hour") is not None:
+        lines.append("- 峰值时段：%02d:00–%02d:00（%d 次）"
+                     % (today["peak_hour"], today["peak_hour"] + 1, today["peak_hour_count"]))
+    return lines
+
+
+def _credit_sort_key(credits, rates, name):
+    entry = credits.get(name) or {}
+    left = entry.get("left")
+    rate = rates.get(name)
+    if rate and left is not None:
+        return (0, int(left / rate), name)
+    return (1, 0, name)
+
+
+def _num(value):
+    if value is None:
+        return "?"
+    if isinstance(value, float) and value == int(value):
+        return str(int(value))
+    return str(value)
+
+
+def render_credits(metrics, history):
+    """运营明细：额度。按可撑天数升序（最紧的在前）。"""
+    lines = ["### 额度", ""]
+    credits = metrics.get("credits")
+    if not credits:
+        lines.append("账号余额采集失败。")
+        return lines
+
+    base = history.get("credit_base")
+    today_row = {"date": history.get("today"), "credits": credits}
+    rates = daily_consumption(base, today_row) if base else {}
+
+    rows = []
+    for name in sorted(credits, key=lambda n: _credit_sort_key(credits, rates, n)):
+        entry = credits.get(name) or {}
+        left = entry.get("left")
+        rate = rates.get(name)
+        rows.append((name,
+                     "—" if left is None else "%s / %s" % (_num(left), _num(entry.get("total"))),
+                     "—" if rate is None else "%.1f" % rate,
+                     "—" if (not rate or left is None) else "%d" % int(left / rate)))
+    lines.extend(table_lines(["账号", "余额", "日均消耗", "可撑天数"], rows))
+    if not base:
+        lines.append("")
+        lines.append("> 日均消耗需要至少两条余额记录，明天起可用。")
+    return lines
+
+
+def render_system(metrics, history, failures):
+    """运营明细：系统。"""
+    lines = ["### 系统", ""]
+    host = metrics.get("host")
+    yesterday_host = (history.get("yesterday") or {}).get("host") or {}
+
+    if host and host.get("mem_pct") is not None:
+        mem = "内存 %d%%" % host["mem_pct"]
+        if yesterday_host.get("mem_pct") is not None:
+            mem += "（昨日 %d%%）" % yesterday_host["mem_pct"]
+    else:
+        mem = "内存 采集失败"
+    if host and host.get("load1") is not None:
+        load = "负载 %.2f / %.2f / %.2f" % (host["load1"], host["load5"], host["load15"])
+    else:
+        load = "负载 采集失败"
+    disk = ("磁盘 %d%%" % host["disk_pct"]) if host and host.get("disk_pct") is not None \
+        else "磁盘 采集失败"
+    lines.append("- %s ｜ %s ｜ %s" % (mem, load, disk))
+
+    journal = metrics.get("journal")
+    if journal:
+        parts = ["%s %d" % (unit, count) for unit, count in
+                 sorted(journal["by_unit"].items(), key=lambda kv: (-kv[1], kv[0]))]
+        lines.append("- journal 错误 %d 行：%s" % (journal["total"], " ｜ ".join(parts) or "无"))
+    else:
+        lines.append("- journal 错误 采集失败")
+
+    nginx_errors = metrics.get("nginx_errors")
+    lines.append("- nginx error log 今日 %s 行"
+                 % (nginx_errors["today_lines"] if nginx_errors else "采集失败"))
+
+    ssh = metrics.get("ssh")
+    lines.append("- SSH：失败 %s 次 ｜ 成功 %s 次"
+                 % ((ssh["failed"], ssh["accepted"]) if ssh else ("采集失败", "采集失败")))
+
+    if host and host.get("failed_units"):
+        lines.append("- 失败的 systemd 单元：%s" % "、".join(host["failed_units"]))
+    if host and host.get("uptime_s") is not None:
+        days, remainder = divmod(int(host["uptime_s"]), 86400)
+        lines.append("- 运行时长：%d 天 %d 小时" % (days, remainder // 3600))
+    if failures:
+        lines.append("- 采集失败的节：%s" % "、".join(sorted(failures)))
+    return lines
+
+
+def render_ops(metrics, history, failures):
+    """第二节：运营明细。"""
+    lines = ["## 二、运营明细", ""]
+    lines.extend(render_requests(metrics, history))
+    lines.append("")
+    lines.extend(render_credits(metrics, history))
+    lines.append("")
+    lines.extend(render_system(metrics, history, failures))
+    return lines
+
+
+def render(metrics, history, problems, failures, now=None, hostname=None):
+    """渲染完整日报（markdown）。"""
+    now = now or datetime.now()
+    hostname = hostname or socket.gethostname()
+    host = metrics.get("host") or {}
+
+    lines = ["# 服务器日报 %s" % now.strftime("%Y-%m-%d"), ""]
+    lines.append(render_conclusion(metrics, problems))
+    uptime = ""
+    if host.get("uptime_s") is not None:
+        uptime = " ｜ 已运行 %d 天" % (int(host["uptime_s"]) // 86400)
+    lines.append("生成时间 %s ｜ 主机 %s%s"
+                 % (now.strftime("%Y-%m-%d %H:%M:%S"), hostname, uptime))
+    lines.append("")
+    lines.extend(render_hard_checks(metrics, problems))
+    lines.append("")
+    lines.extend(render_ops(metrics, history, failures))
+    lines.append("")
+    lines.append("---")
+    lines.append("由 notify + daily-report.py 自动生成")
+    return "\n".join(lines) + "\n"
+
+
 # ---- main -----------------------------------------------------------------
 
 
