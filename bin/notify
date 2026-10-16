@@ -1,0 +1,16 @@
+#!/bin/sh
+# notify 免安装入口：加载密钥环境变量后以模块方式运行。
+set -eu
+
+if [ -f /etc/notify/env ]; then
+    set -a
+    # shellcheck disable=SC1091
+    . /etc/notify/env
+    set +a
+fi
+
+NOTIFY_HOME="${NOTIFY_HOME:-/opt/notify}"
+PYTHONPATH="${NOTIFY_HOME}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH
+
+exec python3 -m notify "$@"
