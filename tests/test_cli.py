@@ -194,5 +194,106 @@ class TestSendCommand(CliTestCase):
         self.assertIn("usage", self.err.getvalue().lower())
 
 
+class TestTestCommand(CliTestCase):
+    def test_success_returns_0(self):
+        code = self.run_cli(["test"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("✓", self.out.getvalue())
+        self.assertIn("自检", self.channel.envelopes[0].subject)
+
+    def test_failure_returns_1(self):
+        self.channel = FakeChannel(
+            "email:directmail", "notice@example.com",
+            failures=[PermanentChannelError("535 认证失败")],
+        )
+        code = self.run_cli(["test"])
+        self.assertEqual(code, EXIT_ALL_FAILED)
+        self.assertIn("535", self.err.getvalue())
+
+    def test_no_ready_channel_returns_2(self):
+        code = self.run_cli(["test"], channels=[])
+        self.assertEqual(code, EXIT_CONFIG)
+        self.assertIn("就绪", self.err.getvalue())
+
+    def test_self_test_ignores_dedup_state(self):
+        self.run_cli(["test"])
+        self.run_cli(["test"])
+        self.assertEqual(self.channel.calls, 2)
+
+
+class TestChannelsCommand(CliTestCase):
+    def test_lists_channel_state(self):
+        code = self.run_cli(["channels"])
+        self.assertEqual(code, EXIT_OK)
+        text = self.out.getvalue()
+        self.assertIn("email:directmail", text)
+        self.assertIn("就绪", text)
+
+    def test_marks_unready_channel(self):
+        self.channel = FakeChannel("email:qq", ready=False)
+        self.run_cli(["channels"])
+        self.assertIn("未就绪", self.out.getvalue())
+
+
+class TestLogCommand(CliTestCase):
+    def test_prints_recent_records(self):
+        self.run_cli(["send", "--title", "日报", "--body", "b"])
+        self.out.seek(0)
+        self.out.truncate(0)
+        code = self.run_cli(["log"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("delivery", self.out.getvalue())
+        self.assertIn("email:directmail", self.out.getvalue())
+
+    def test_json_output_is_parseable(self):
+        self.run_cli(["send", "--title", "日报", "--body", "b"])
+        self.out.seek(0)
+        self.out.truncate(0)
+        self.run_cli(["log", "--json"])
+        records = json.loads(self.out.getvalue())
+        self.assertEqual(records[0]["event"], "delivery")
+
+    def test_limit_option(self):
+        for index in range(3):
+            self.run_cli(
+                ["send", "--title", "日报", "--body", "b", "--dedup-key", "k%d" % index]
+            )
+        self.out.seek(0)
+        self.out.truncate(0)
+        self.run_cli(["log", "-n", "1", "--json"])
+        self.assertEqual(len(json.loads(self.out.getvalue())), 1)
+
+    def test_missing_log_file_is_not_an_error(self):
+        code = self.run_cli(["log"])
+        self.assertEqual(code, EXIT_OK)
+
+
+class TestDoctorCommand(CliTestCase):
+    def test_all_good_returns_0(self):
+        with mock.patch("notify.cli.check_tcp", return_value=None), \
+             mock.patch("notify.cli.check_dns", return_value=["跳过 DNS 检查（测试）"]):
+            code = self.run_cli(["doctor"])
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("就绪", self.out.getvalue())
+
+    def test_tcp_failure_returns_2(self):
+        with mock.patch("notify.cli.check_tcp", return_value="连接被拒绝"), \
+             mock.patch("notify.cli.check_dns", return_value=[]):
+            code = self.run_cli(["doctor"])
+        self.assertEqual(code, EXIT_CONFIG)
+        self.assertIn("连接被拒绝", self.out.getvalue())
+
+    def test_no_ready_channel_returns_2(self):
+        self.channel = FakeChannel("email:qq", ready=False)
+        with mock.patch("notify.cli.check_tcp", return_value=None), \
+             mock.patch("notify.cli.check_dns", return_value=[]):
+            code = self.run_cli(["doctor"])
+        self.assertEqual(code, EXIT_CONFIG)
+
+    def test_missing_config_returns_2(self):
+        code = self.run_cli(["doctor", "--config", str(self.root / "nope.ini")], config=None)
+        self.assertEqual(code, EXIT_CONFIG)
+
+
 if __name__ == "__main__":
     unittest.main()
