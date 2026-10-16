@@ -15,15 +15,18 @@
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
+import re
 import socket
 import ssl
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ---- 本机配置（可用环境变量覆盖） ----------------------------------------
@@ -62,6 +65,30 @@ PORTS = [
 
 HTTP_TIMEOUT = 10
 
+# ---- 硬故障阈值（克刻口径：只有这几类会进结论） --------------------------
+
+DISK_HARD_PCT = 90
+CERT_HARD_DAYS = 7
+BACKUP_MAX_AGE_HOURS = 26
+
+BACKUP_ROOT = Path("/www/backup/database")
+CERT_CONF_DIR = Path("/www/server/panel/vhost/nginx")
+SECURE_LOG = Path("/var/log/secure")
+NGINX_LOG_DIR = Path("/www/wwwlogs")
+REQUEST_LOG_DIR = WB_DIR / "data" / "request-logs"
+
+SNAPSHOT_PATH = Path(os.environ.get("NOTIFY_STATS", "/var/lib/notify/daily-stats.jsonl"))
+SNAPSHOT_RETAIN_DAYS = 400
+CREDIT_WINDOW_DAYS = 7
+
+# 已知项白名单：(站点显示名, 状态关键字, 原因)。命中者永不进硬故障。
+KNOWN_ISSUES = [
+    ("shiliu153.cn (https)", "证书不匹配", ".cn 正在备案中，暂不处理证书"),
+]
+
+MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
 
 # ---- 小工具 ---------------------------------------------------------------
 
@@ -98,6 +125,64 @@ def human_tokens(num):
     if num >= 1_000:
         return "%.1fK" % (num / 1_000)
     return str(num)
+
+
+def percentile(values, p):
+    """nearest-rank 分位。会就地排序 values。空列表返回 None。"""
+    if not values:
+        return None
+    values.sort()
+    return values[min(len(values) - 1, int(len(values) * p))]
+
+
+def delta(today_value, yesterday_value):
+    """环比字符串。任一侧为 None 或基数为 0 → '—'。"""
+    if today_value is None or yesterday_value is None:
+        return "—"
+    if yesterday_value == 0:
+        return "—"
+    return "%+.0f%%" % (100.0 * (today_value - yesterday_value) / yesterday_value)
+
+
+def read_jsonl(path):
+    """逐行解析 JSONL，返回 (rows, 坏行数)。文件缺失 → ([], 0)。"""
+    rows = []
+    bad = 0
+    try:
+        with open(str(path), "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    bad += 1
+    except OSError:
+        return [], 0
+    return rows, bad
+
+
+def month_day_prefix(moment):
+    """syslog 的 'Oct 16 ' 前缀（英文月份 + 空格填充日 + 尾随空格）。
+
+    不用 strftime：%b 受 locale 影响，而日志固定是英文月份。
+    尾随空格是必须的——否则 'Oct 1' 会匹配到 'Oct 16'。
+    """
+    return "%s %2d " % (MONTH_ABBR[moment.month - 1], moment.day)
+
+
+def known_reason(label, note):
+    """命中已知项白名单则返回原因，否则 None。"""
+    for known_label, keyword, reason in KNOWN_ISSUES:
+        if label == known_label and keyword in note:
+            return reason
+    return None
+
+
+def is_known_issue(label, note):
+    """是否命中已知项白名单。"""
+    return known_reason(label, note) is not None
 
 
 def section(title):
