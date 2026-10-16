@@ -1,5 +1,5 @@
 #!/bin/sh
-# notify 免安装入口：加载密钥环境变量后以模块方式运行。
+# notify 免安装入口：挑一个 >= 3.7 的解释器，加载密钥环境变量后以模块方式运行。
 set -eu
 
 if [ -f /etc/notify/env ]; then
@@ -13,4 +13,28 @@ NOTIFY_HOME="${NOTIFY_HOME:-/opt/notify}"
 PYTHONPATH="${NOTIFY_HOME}${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTHONPATH
 
-exec python3 -m notify "$@"
+# Alibaba Cloud Linux 3 的系统 python3 是 3.6.8，而本代码用了 dataclasses 与
+# from __future__ import annotations（均需 3.7+）。因此按版本从高到低挑一个能用的，
+# 而不是盲目用 python3。可用 NOTIFY_PYTHON 显式指定解释器。
+pick_python() {
+    for candidate in python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; then
+                printf '%s' "$candidate"
+                return 0
+            fi
+        fi
+    done
+    return 1
+}
+
+if [ -n "${NOTIFY_PYTHON:-}" ]; then
+    PYTHON="$NOTIFY_PYTHON"
+elif PYTHON="$(pick_python)"; then
+    :
+else
+    echo "notify: 找不到 Python >= 3.7（系统 python3 是 $(python3 -V 2>&1)）。请安装 python3.8+，或设置 NOTIFY_PYTHON 指定解释器。" >&2
+    exit 2
+fi
+
+exec "$PYTHON" -m notify "$@"
